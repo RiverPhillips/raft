@@ -36,6 +36,8 @@ type Server struct {
 	// Volatile state on leaders
 	nextIndex  []int
 	matchIndex []int
+
+	leader *ClusterMember
 }
 
 func getElectionTimeout() time.Duration {
@@ -76,6 +78,10 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 	if req.Term == s.currentTerm && s.state == candidate {
 		s.state = follower
 		slog.Debug("Transitioning to follower", "Term", s.currentTerm)
+	}
+
+	if s.leader == nil || req.LeaderID != s.leader.Id {
+		s.leader = s.getMemberById(req.LeaderID)
 	}
 
 	if s.state != follower {
@@ -190,7 +196,6 @@ func (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse)
 
 func (s *Server) Start(ctx context.Context) error {
 	s.state = follower
-
 	// todo: Load state from disk
 
 	slog.Debug("Starting server as follower")
@@ -204,14 +209,11 @@ func (s *Server) Start(ctx context.Context) error {
 			slog.Debug("Shutting down raft server")
 			return nil
 		case <-s.electionTicker.C:
-			if s.state == leader {
-				// If we're the leader we shouldn't be running an election timer
-				// Something has gone wrong
-				panic("Leader running election timer")
-			}
-
 			slog.Debug("Election timer elapsed, transitioning to candidate")
 			s.mu.Lock()
+			if s.state == leader {
+				panic("Illegal state transition from leader to candidate")
+			}
 			s.state = candidate
 			s.currentTerm++
 			s.votedFor = s.id
@@ -239,6 +241,20 @@ func (s *Server) Start(ctx context.Context) error {
 			s.sendHeartbeat()
 		}
 	}
+}
+
+func (s *Server) ApplyCommand(cmds [][]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.state != leader {
+		// Todo we should return info about the new leader
+		return &NotLeaderError{LeaderId: s.leader.Id, LeaderAddr: s.leader.Addr}
+	}
+
+	slog.Debug("Processing new commands", "commands", len(cmds))
+
+	return nil
 }
 
 func (s *Server) requestVoteFromMember(member *ClusterMember) {
@@ -298,6 +314,9 @@ func (s *Server) checkIfElected() {
 			}
 			if votesReceived == quorum {
 				slog.Debug("Received quorum of votes, transitioning to leader")
+				if s.state == follower {
+					panic("Invalid state transition from follower to leader")
+				}
 				s.state = leader
 				s.electionTicker.Stop()
 				s.heartbeatTicker.Reset(heartbeatTimeout)
@@ -384,4 +403,14 @@ func (s *Server) makeRpcCall(member *ClusterMember, methodName string, req any, 
 	}
 
 	return nil
+}
+
+func (s *Server) getMemberById(id memberId) *ClusterMember {
+	// Todo: Do we need a map or is it so small it's irrelevant?
+	for _, member := range s.clusterMembers {
+		if member.Id == id {
+			return member
+		}
+	}
+	panic("Member not found")
 }

@@ -92,12 +92,20 @@ func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T)
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
 	server.currentTerm = 2
 
 	args := &AppendEntriesRequest{
 		Term:         1,
-		LeaderID:     0,
+		LeaderID:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
 		Entries: []LogEntry{
@@ -125,8 +133,15 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
-
 	server.currentTerm = 2
 	server.log = []LogEntry{
 		{
@@ -137,7 +152,7 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 
 	args := &AppendEntriesRequest{
 		Term:         3,
-		LeaderID:     0,
+		LeaderID:     2,
 		PrevLogIndex: 2,
 		PrevLogTerm:  1,
 		Entries:      []LogEntry{},
@@ -157,7 +172,16 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
+
 	server.state = candidate
 	server.currentTerm = 2
 
@@ -183,7 +207,16 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
+
 	server.state = leader
 	server.currentTerm = 2
 
@@ -209,7 +242,16 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
+
 	server.currentTerm = 1
 	server.log = append(server.log, LogEntry{
 		Term:    1,
@@ -258,7 +300,16 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 			Id:   NewMemberId(1),
 			Addr: "",
 		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "",
+		},
 	})
+
 	server.currentTerm = 1
 	server.log = append(server.log, LogEntry{
 		Term:    1,
@@ -302,4 +353,84 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 			Command: []byte("test2"),
 		},
 	}, server.log)
+}
+
+func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
+	server := NewServer(NewMemberId(1), []*ClusterMember{
+		{
+			Id:   NewMemberId(1),
+			Addr: "one",
+		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "two",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "three",
+		},
+	})
+
+	// Send a heartbeat to the follower so it knows who the leader is
+	args := &AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      []LogEntry{},
+		LeaderCommit: 0,
+	}
+
+	resp := &AppendEntriesResponse{}
+	require.NoError(t, server.AppendEntries(args, resp))
+	require.True(t, resp.Success)
+
+	err := server.ApplyCommand([][]byte{
+		[]byte("test"),
+	})
+
+	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
+
+	assert.Equal(t, expectedErr, err)
+}
+
+func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
+	server := NewServer(NewMemberId(1), []*ClusterMember{
+		{
+			Id:   NewMemberId(1),
+			Addr: "one",
+		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "two",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "three",
+		},
+	})
+
+	// Send a heartbeat to the follower so it knows who the leader is
+	args := &AppendEntriesRequest{
+		Term:         1,
+		LeaderID:     2,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
+		Entries:      []LogEntry{},
+		LeaderCommit: 0,
+	}
+
+	server.state = candidate
+
+	resp := &AppendEntriesResponse{}
+	require.NoError(t, server.AppendEntries(args, resp))
+	require.True(t, resp.Success)
+
+	err := server.ApplyCommand([][]byte{
+		[]byte("test"),
+	})
+
+	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
+
+	assert.Equal(t, expectedErr, err)
 }

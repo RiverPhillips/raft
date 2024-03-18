@@ -60,3 +60,12 @@ type ClusterMember struct {
 	Addr      string
 	votedFor  memberId
 }
+
+type NotLeaderError struct {
+	LeaderId   memberId
+	LeaderAddr string
+}
+
+func (e *NotLeaderError) Error() string {
+	return "not the leader"
+}
