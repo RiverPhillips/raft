@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	heartbeatTimeout   = time.Millisecond * 500
-	minElectionTimeout = 1500
+	heartbeatTimeout   = time.Millisecond * 50
+	minElectionTimeout = 150
 )
 
 type Server struct {
@@ -70,49 +70,86 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if req.Term < s.currentTerm {
-		// This is a stale request from an old leader
-		resp.Term = s.currentTerm
-		s.mu.Unlock()
-		resp.Success = false
-		return nil
-	}
+	s.updateTerm(req.Term)
 
-	s.resetElectionTimer()
-
-	// If RPC request or response contains Term T >= currentTerm: set currentTerm = T, convert to follower
-	if req.Term >= s.currentTerm && s.state == candidate {
+	// If AppendEntries RPC received from new leader: convert to follower
+	if req.Term == s.currentTerm && s.state == candidate {
 		s.state = follower
-		s.currentTerm = req.Term
-		s.votedFor = 0
 		slog.Debug("Transitioning to follower", "Term", s.currentTerm)
 	}
 
-	// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm
-	logLen := uint64(len(s.log) - 1)
-	if (logLen) < req.PrevLogIndex || s.log[req.PrevLogIndex].Term != req.PrevLogTerm {
-		resp.Term = s.currentTerm
-		s.mu.Unlock()
-		resp.Success = false
+	if s.state != follower {
+		panic("Only followers should be receiving append entries")
+	}
+
+	resp.Term = s.currentTerm
+	resp.Success = false
+
+	if req.Term < s.currentTerm {
+		// This is a stale request from an old leader
+		slog.Debug("Rejecting append entries request from stale leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "leader", req.LeaderID)
 		return nil
 	}
 
-	// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-	if logLen > req.PrevLogIndex+1 {
-		s.log = s.log[:req.PrevLogIndex+1]
+	// We have a valid leader
+	s.resetElectionTimer()
+
+	slog.Debug("Received append entries request from valid leader", "server", s.id, "term", req.Term, "leader", req.LeaderID, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", req.PrevLogTerm, "entries", len(req.Entries))
+
+	// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm
+	logLen := uint64(len(s.log))
+	validLog := req.PrevLogIndex == 0 || (req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
+
+	if !validLog {
+		slog.Debug("Rejecting append entries request. Log was not valid", "server", s.id, "term", req.Term, "leader", req.LeaderID, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", req.PrevLogTerm, "logLength", logLen)
+		return nil
 	}
 
-	// 4. Append any new entries not already in the log
-	// Check which entries are new
+	nextIdx := req.PrevLogIndex + 1
+
+	for i := nextIdx; i < nextIdx+uint64(len(req.Entries)); i++ {
+		entry := req.Entries[i-nextIdx]
+		if i >= uint64(cap(s.log)) {
+			// We're at the capacity of the log let's increase the capacity
+			newLen := nextIdx + uint64(len(req.Entries))
+			newLog := make([]LogEntry, i, newLen*2)
+			copy(newLog, s.log)
+			s.log = newLog
+		} else if s.log[i].Term != req.Entries[i-nextIdx].Term {
+			s.log = s.log[:i]
+			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "leader", req.LeaderID, "index", i, "logLength", len(s.log))
+		}
+
+		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "leader", req.LeaderID, "index", i, "logLength", len(s.log))
+		if i < uint64(len(s.log)) {
+			slog.Debug("Log is unchanged")
+		} else {
+			s.log = append(s.log, entry)
+		}
+	}
 
 	if req.LeaderCommit > s.commitIndex {
 		s.commitIndex = min(req.LeaderCommit, logLen)
 	}
 
-	resp.Term = s.currentTerm
+	// Todo: update state on disk
+
 	resp.Success = true
 
 	return nil
+}
+
+// Must be called with the lock held
+func (s *Server) updateTerm(term Term) bool {
+	if term > s.currentTerm {
+		s.state = follower
+		s.currentTerm = term
+		s.votedFor = 0
+		// Todo: update state on disk
+		s.resetElectionTimer()
+		return true
+	}
+	return false
 }
 
 // Must be called with the lock held
@@ -125,13 +162,7 @@ func (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse)
 	slog.Info("Received request for vote", "server", s.id, "term", req.Term, "candidate", req.CandidateID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if req.Term > s.currentTerm {
-		s.currentTerm = req.Term
-		s.state = follower
-		s.votedFor = 0
-		s.resetElectionTimer()
-	}
+	s.updateTerm(req.Term)
 
 	resp.Term = s.currentTerm
 	resp.VoteGranted = false
@@ -184,7 +215,6 @@ func (s *Server) Start(ctx context.Context) error {
 			s.state = candidate
 			s.currentTerm++
 			s.votedFor = s.id
-			s.mu.Unlock()
 
 			for _, member := range s.clusterMembers {
 				member.votedFor = 0
@@ -198,7 +228,7 @@ func (s *Server) Start(ctx context.Context) error {
 				go s.requestVoteFromMember(member)
 			}
 			s.checkIfElected()
-
+			s.mu.Unlock()
 			// Send RequestVote RPCs to all other servers
 			// If votes received from a quorum of servers: become leader
 		case <-s.heartbeatTicker.C:
@@ -214,13 +244,18 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) requestVoteFromMember(member *ClusterMember) {
 	slog.Debug("Requesting vote from server", "server", member.Id)
 
+	s.mu.Lock()
 	logLen := uint64(len(s.log) - 1)
+	lastLogTerm := s.log[len(s.log)-1].Term
 
 	req := &RequestVoteRequest{
 		Term:         s.currentTerm,
 		CandidateID:  s.id,
 		LastLogIndex: logLen,
+		LastLogTerm:  lastLogTerm,
 	}
+
+	s.mu.Unlock()
 
 	resp := &RequestVoteResponse{}
 	if err := s.makeRpcCall(member, "Server.RequestVote", req, resp); err != nil {
@@ -228,24 +263,16 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 		// This will be retried on the next election timer tick
 		return
 	}
-
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
 
-	// If RPC request or response contains Term T > currentTerm: set currentTerm = T, convert to follower
-	if resp.Term > s.currentTerm {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.currentTerm = resp.Term
-		s.state = follower
-		s.votedFor = 0
-		s.resetElectionTimer()
-		slog.Debug("Transitioning to follower", "Term", s.currentTerm)
-		// Todo: update state on disk
+	if s.updateTerm(resp.Term) {
 		return
 	}
 
 	if resp.Term != req.Term {
-		// This is a stale response - no op
+		// This is an invalid response - no o
 		return
 	}
 
@@ -256,6 +283,7 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 	}
 }
 
+// Must be called with the lock held
 func (s *Server) checkIfElected() {
 	if s.state == candidate {
 		// If we're a candidate we need to check if we've received a majority of votes
@@ -264,8 +292,6 @@ func (s *Server) checkIfElected() {
 		quorum := (len(s.clusterMembers) + 1) / 2
 		slog.Debug("Checking if elected", "quorumSize", quorum)
 		votesReceived := 0
-		s.mu.Lock()
-		defer s.mu.Unlock()
 		for _, member := range s.clusterMembers {
 			if member.votedFor == s.id {
 				votesReceived++

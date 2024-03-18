@@ -81,9 +81,12 @@ func main() {
 		}
 	}()
 
-	raftServer.Start(ctx)
+	if err := raftServer.Start(ctx); err != nil {
+		slog.Error("failed to start server", "error", err)
+		os.Exit(1)
+	}
 
-	slog.Info("Shutting down server")
+	slog.Info("Shutting down http server")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
