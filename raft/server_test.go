@@ -8,12 +8,7 @@ import (
 )
 
 func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.currentTerm = 2
 
@@ -32,13 +27,26 @@ func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
 	require.False(t, result.VoteGranted)
 }
 
-func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
+func createNewServer() *Server {
+	sm := &NoOpStateMachine{}
+	return NewServer(NewMemberId(1), sm, []*ClusterMember{
 		{
 			Id:   NewMemberId(1),
-			Addr: "",
+			Addr: "one",
+		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "two",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "three",
 		},
 	})
+}
+
+func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
+	server := createNewServer()
 
 	server.currentTerm = 1
 	server.log = append(server.log, LogEntry{
@@ -62,12 +70,7 @@ func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
 }
 
 func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.currentTerm = 0
 
@@ -87,20 +90,7 @@ func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testin
 }
 
 func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 	server.currentTerm = 2
 
 	args := &AppendEntriesRequest{
@@ -128,20 +118,7 @@ func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T)
 }
 
 func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 	server.currentTerm = 2
 	server.log = []LogEntry{
 		{
@@ -167,20 +144,7 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidateState(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.state = candidate
 	server.currentTerm = 2
@@ -202,20 +166,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderState(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.state = leader
 	server.currentTerm = 2
@@ -237,20 +188,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 }
 
 func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.currentTerm = 1
 	server.log = append(server.log, LogEntry{
@@ -295,20 +233,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 }
 
 func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntries(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "",
-		},
-	})
+	server := createNewServer()
 
 	server.currentTerm = 1
 	server.log = append(server.log, LogEntry{
@@ -356,20 +281,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 }
 
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "one",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "two",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "three",
-		},
-	})
+	server := createNewServer()
 
 	// Send a heartbeat to the follower so it knows who the leader is
 	args := &AppendEntriesRequest{
@@ -385,9 +297,8 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 	require.NoError(t, server.AppendEntries(args, resp))
 	require.True(t, resp.Success)
 
-	err := server.ApplyCommand([][]byte{
-		[]byte("test"),
-	})
+	res, err := server.ApplyCommand([]byte("test"))
+	assert.Nil(t, res)
 
 	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
 
@@ -395,20 +306,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 }
 
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
-	server := NewServer(NewMemberId(1), []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "one",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "two",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "three",
-		},
-	})
+	server := createNewServer()
 
 	// Send a heartbeat to the follower so it knows who the leader is
 	args := &AppendEntriesRequest{
@@ -426,9 +324,8 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 	require.NoError(t, server.AppendEntries(args, resp))
 	require.True(t, resp.Success)
 
-	err := server.ApplyCommand([][]byte{
-		[]byte("test"),
-	})
+	res, err := server.ApplyCommand([]byte("test"))
+	assert.Nil(t, res)
 
 	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
 

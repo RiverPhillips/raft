@@ -38,13 +38,15 @@ type Server struct {
 	matchIndex []int
 
 	leader *ClusterMember
+
+	stateMachine StateMachine
 }
 
 func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(minElectionTimeout+rand.Intn(150))
 }
 
-func NewServer(id memberId, members []*ClusterMember) *Server {
+func NewServer(id memberId, sm StateMachine, members []*ClusterMember) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
 	}
@@ -63,6 +65,7 @@ func NewServer(id memberId, members []*ClusterMember) *Server {
 		heartbeatTicker: hbTicker,
 		clusterMembers:  members,
 		log:             []LogEntry{{}}, // Todo: Load from disk
+		stateMachine:    sm,
 	}
 }
 
@@ -243,18 +246,55 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 }
 
-func (s *Server) ApplyCommand(cmds [][]byte) error {
+func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.state != leader {
-		// Todo we should return info about the new leader
-		return &NotLeaderError{LeaderId: s.leader.Id, LeaderAddr: s.leader.Addr}
+		return nil, &NotLeaderError{LeaderId: s.leader.Id, LeaderAddr: s.leader.Addr}
 	}
 
 	slog.Debug("Processing new commands", "commands", len(cmds))
 
-	return nil
+	// Append the command(s) to the log
+	for _, cmd := range cmds {
+		s.log = append(s.log, LogEntry{
+			Term:    s.currentTerm,
+			Command: cmd,
+		})
+	}
+
+	// Todo: persist to disk
+
+	var wg sync.WaitGroup
+	wg.Add(s.getQuorumSize())
+	// Issue AppendEntries RPCs in parallel to each of the other servers to replicate the entry
+	for _, member := range s.clusterMembers {
+		if member.Id == s.id {
+			continue
+		}
+
+		go func() {
+			for {
+				resp := &AppendEntriesResponse{}
+				err := s.makeRpcCall(member, "Server.AppendEntries", &AppendEntriesRequest{}, resp)
+				if err != nil {
+					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", resp.Success)
+				} else if !resp.Success {
+					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", resp.Term, "leaderTerm", s.currentTerm)
+					// Todo if this happens we need to try and replicate the missing entries from the follower
+				} else {
+					break
+				}
+			}
+			wg.Done()
+		}()
+	}
+	// When the entry has been safely replicated, apply it to the state machine
+	wg.Wait()
+
+	// Return the result of that execution to the client, this can't return an error as the command is already committed.
+	return s.stateMachine.Apply(cmds...), nil
 }
 
 func (s *Server) requestVoteFromMember(member *ClusterMember) {
@@ -305,7 +345,7 @@ func (s *Server) checkIfElected() {
 		// If we're a candidate we need to check if we've received a majority of votes
 		// If we have, we become the leader
 
-		quorum := (len(s.clusterMembers) + 1) / 2
+		quorum := s.getQuorumSize()
 		slog.Debug("Checking if elected", "quorumSize", quorum)
 		votesReceived := 0
 		for _, member := range s.clusterMembers {
@@ -332,6 +372,12 @@ func (s *Server) checkIfElected() {
 			}
 		}
 	}
+}
+
+func (s *Server) getQuorumSize() int {
+	// This doesn't change at the moment, but it's a good idea to have a function for
+	// it as raft can support dynamic cluster membership
+	return (len(s.clusterMembers) + 1) / 2
 }
 
 func (s *Server) initializeVolatileLeaderState() {

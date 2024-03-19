@@ -61,7 +61,7 @@ func main() {
 	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	slog.SetDefault(slog.New(h))
 
-	raftServer := raft.NewServer(raft.NewMemberId(uint16(*memberIDFlag)), members)
+	raftServer := raft.NewServer(raft.NewMemberId(uint16(*memberIDFlag)), &raft.NoOpStateMachine{}, members)
 
 	if err := rpc.Register(raftServer); err != nil {
 		slog.Error("failed to register rpc", "error", err)

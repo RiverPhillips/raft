@@ -8,7 +8,7 @@ type Term uint64
 
 type LogEntry struct {
 	Term    Term
-	Command []byte
+	Command Command
 }
 
 type AppendEntriesRequest struct {
@@ -68,4 +68,12 @@ type NotLeaderError struct {
 
 func (e *NotLeaderError) Error() string {
 	return "not the leader"
+}
+
+type Command []byte
+
+type Result []byte
+
+type StateMachine interface {
+	Apply(commands ...Command) []Result
 }
