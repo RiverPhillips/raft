@@ -146,7 +146,7 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidateState(t *testing.T) {
 	server := createNewServer()
 
-	server.state = candidate
+	server.state = Candidate
 	server.currentTerm = 2
 
 	args := &AppendEntriesRequest{
@@ -162,13 +162,13 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 	require.NoError(t, server.AppendEntries(args, result))
 
 	assert.Equal(t, Term(3), server.currentTerm)
-	assert.Equal(t, follower, server.state)
+	assert.Equal(t, Follower, server.state)
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderState(t *testing.T) {
 	server := createNewServer()
 
-	server.state = leader
+	server.state = Leader
 	server.currentTerm = 2
 
 	args := &AppendEntriesRequest{
@@ -184,27 +184,23 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 	require.NoError(t, server.AppendEntries(args, result))
 
 	assert.Equal(t, Term(3), server.currentTerm)
-	assert.Equal(t, follower, server.state)
+	assert.Equal(t, Follower, server.state)
 }
 
 func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 	server := createNewServer()
 
 	server.currentTerm = 1
-	server.log = append(server.log, LogEntry{
-		Term:    1,
-		Command: []byte("test"),
-	})
 
 	args := &AppendEntriesRequest{
 		Term:         1,
 		LeaderID:     2,
-		PrevLogIndex: 1,
-		PrevLogTerm:  1,
+		PrevLogIndex: 0,
+		PrevLogTerm:  0,
 		Entries: []LogEntry{
 			{
 				Term:    1,
-				Command: []byte("test2"),
+				Command: []byte("test"),
 			},
 		},
 		LeaderCommit: 1,
@@ -224,10 +220,6 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 		{
 			Term:    1,
 			Command: []byte("test"),
-		},
-		{
-			Term:    1,
-			Command: []byte("test2"),
 		},
 	}, server.log)
 }
@@ -283,7 +275,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 	server := createNewServer()
 
-	// Send a heartbeat to the follower so it knows who the leader is
+	// Send a heartbeat to the Follower so it knows who the Leader is
 	args := &AppendEntriesRequest{
 		Term:         1,
 		LeaderID:     2,
@@ -308,7 +300,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 	server := createNewServer()
 
-	// Send a heartbeat to the follower so it knows who the leader is
+	// Send a heartbeat to the Follower so it knows who the Leader is
 	args := &AppendEntriesRequest{
 		Term:         1,
 		LeaderID:     2,
@@ -318,7 +310,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 		LeaderCommit: 0,
 	}
 
-	server.state = candidate
+	server.state = Candidate
 
 	resp := &AppendEntriesResponse{}
 	require.NoError(t, server.AppendEntries(args, resp))

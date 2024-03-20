@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/RiverPhillips/raft/kv"
 	"log/slog"
 	"net/http"
 	"net/rpc"
@@ -26,6 +27,9 @@ var memberIDFlag = flag.Int("id", 1, "ID of the member")
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	ctx, canc := context.WithCancel(ctx)
+	defer canc()
 
 	flag.Parse()
 
@@ -61,7 +65,9 @@ func main() {
 	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
 	slog.SetDefault(slog.New(h))
 
-	raftServer := raft.NewServer(raft.NewMemberId(uint16(*memberIDFlag)), &raft.NoOpStateMachine{}, members)
+	sm := kv.NewKvStateMachine()
+
+	raftServer := raft.NewServer(raft.NewMemberId(uint16(*memberIDFlag)), sm, members)
 
 	if err := rpc.Register(raftServer); err != nil {
 		slog.Error("failed to register rpc", "error", err)
@@ -79,6 +85,33 @@ func main() {
 			slog.Error("failed to serve", "error", err)
 			os.Exit(1)
 		}
+	}()
+
+	go func() {
+		// Wait for the server to start then dispatch a single command
+		time.Sleep(3 * time.Second)
+
+		if raftServer.State() == raft.Leader {
+			slog.Info("Dispatching command to raft server")
+			// Dispatch a command to the state machine
+			setCmd := kv.SetCommand{Key: "test", Value: "test"}
+			_, err := raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
+			if err != nil && err.Error() != "not the leader" {
+				panic(err)
+			}
+
+			time.Sleep(3 * time.Second)
+
+			getCmd := kv.GetCommand{Key: "test"}
+			result, err := raftServer.ApplyCommand(raft.Command(getCmd.Serialize()))
+			if err != nil && err.Error() != "not the leader" {
+				panic(err)
+			}
+
+			slog.Info("Result of get command", "result", string(result[0]))
+			canc()
+		}
+
 	}()
 
 	if err := raftServer.Start(ctx); err != nil {

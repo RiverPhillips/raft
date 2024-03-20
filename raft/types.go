@@ -37,12 +37,12 @@ type RequestVoteResponse struct {
 	VoteGranted bool
 }
 
-type serverState uint16
+type ServerState uint16
 
 const (
-	leader serverState = iota + 1
-	follower
-	candidate
+	Leader ServerState = iota + 1
+	Follower
+	Candidate
 )
 
 type memberId uint16
@@ -55,10 +55,12 @@ func NewMemberId(id uint16) memberId {
 }
 
 type ClusterMember struct {
-	Id        memberId
-	rpcClient *rpc.Client
-	Addr      string
-	votedFor  memberId
+	Id         memberId
+	rpcClient  *rpc.Client
+	Addr       string
+	votedFor   memberId
+	nextIndex  uint64
+	matchIndex uint64
 }
 
 type NotLeaderError struct {
@@ -67,7 +69,7 @@ type NotLeaderError struct {
 }
 
 func (e *NotLeaderError) Error() string {
-	return "not the leader"
+	return "not the Leader"
 }
 
 type Command []byte
