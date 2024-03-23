@@ -93,14 +93,19 @@ func main() {
 
 		if raftServer.State() == raft.Leader {
 			slog.Info("Dispatching command to raft server")
-			// Dispatch a command to the state machine
-			setCmd := kv.SetCommand{Key: "test", Value: "test"}
+
+			setCmd := kv.SetCommand{Key: "test", Value: "foo"}
 			_, err := raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
 			if err != nil && err.Error() != "not the leader" {
 				panic(err)
 			}
 
-			time.Sleep(3 * time.Second)
+			// Dispatch a command to the state machine
+			setCmd = kv.SetCommand{Key: "test", Value: "test"}
+			_, err = raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
+			if err != nil && err.Error() != "not the leader" {
+				panic(err)
+			}
 
 			getCmd := kv.GetCommand{Key: "test"}
 			result, err := raftServer.ApplyCommand(raft.Command(getCmd.Serialize()))

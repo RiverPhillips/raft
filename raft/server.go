@@ -3,8 +3,9 @@ package raft
 
 import (
 	"context"
+	"crypto/rand"
 	"log/slog"
-	"math/rand"
+	"math/big"
 	"net/rpc"
 	"sync"
 	"time"
@@ -39,7 +40,11 @@ type Server struct {
 }
 
 func getElectionTimeout() time.Duration {
-	return time.Millisecond * time.Duration(minElectionTimeout+rand.Intn(150))
+	r, err := rand.Int(rand.Reader, big.NewInt(150))
+	if err != nil {
+		panic("Failed to generate random number")
+	}
+	return time.Millisecond * time.Duration(minElectionTimeout+r.Int64())
 }
 
 func NewServer(id memberId, sm StateMachine, members []*ClusterMember) *Server {
@@ -74,22 +79,23 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 	s.updateTerm(req.Term)
 
 	// If AppendEntries RPC received from new Leader: convert to Follower
-	if req.Term == s.currentTerm && s.state == Candidate {
+	if s.state == Candidate {
 		s.state = Follower
 		slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
-	}
-
-	if s.leader == nil || req.LeaderID != s.leader.Id {
-		s.leader = s.getMemberById(req.LeaderID)
 	}
 
 	if s.state != Follower {
 		panic("Only followers should be receiving append entries")
 	}
 
+	if s.leader == nil || req.LeaderID != s.leader.Id {
+		s.leader = s.getMemberById(req.LeaderID)
+	}
+
 	resp.Term = s.currentTerm
 	resp.Success = false
 
+	// Reply false if term < currentTerm
 	if req.Term < s.currentTerm {
 		// This is a stale request from an old Leader
 		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "Leader", req.LeaderID)
@@ -112,7 +118,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 
 	nextIdx := req.PrevLogIndex + 1
 
-	for i := nextIdx; i < nextIdx+uint64(len(req.Entries))-1; i++ {
+	for i := nextIdx; i < nextIdx+uint64(len(req.Entries)); i++ {
 		entry := req.Entries[i-nextIdx]
 		if i >= uint64(cap(s.log)) {
 			// We're at the capacity of the log let's increase the capacity
@@ -120,7 +126,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 			newLog := make([]LogEntry, i, newLen*2)
 			copy(newLog, s.log)
 			s.log = newLog
-		} else if s.log[i].Term != req.Entries[i-nextIdx].Term {
+		} else if logLen > i && s.log[i].Term != entry.Term {
 			s.log = s.log[:i]
 			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderID, "index", i, "logLength", len(s.log))
 		}
@@ -211,6 +217,7 @@ func (s *Server) Start(ctx context.Context) error {
 			slog.Debug("Election timer elapsed, transitioning to Candidate")
 			s.mu.Lock()
 			if s.state == Leader {
+				s.mu.Unlock()
 				panic("Illegal state transition from Leader to Candidate")
 			}
 			s.state = Candidate
@@ -235,6 +242,7 @@ func (s *Server) Start(ctx context.Context) error {
 		case <-s.heartbeatTicker.C:
 			s.mu.Lock()
 			if s.state != Leader {
+				s.mu.Unlock()
 				panic("Only leaders should be sending heartbeats")
 			}
 			s.mu.Unlock()
@@ -249,6 +257,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 	s.mu.Lock()
 
 	if s.state != Leader {
+		s.mu.Unlock()
 		return nil, &NotLeaderError{LeaderId: s.leader.Id, LeaderAddr: s.leader.Addr}
 	}
 
@@ -446,9 +455,11 @@ func (s *Server) sendHeartbeat() {
 		go func(member *ClusterMember) {
 			resp := &AppendEntriesResponse{}
 			term := Term(0)
+			s.mu.Lock()
 			if s.log != nil && len(s.log) > 0 {
 				term = s.log[len(s.log)-1].Term
 			}
+			s.mu.Unlock()
 			err := s.makeRpcCall(member, "Server.AppendEntries", &AppendEntriesRequest{
 				Term:         s.currentTerm,
 				LeaderID:     s.id,

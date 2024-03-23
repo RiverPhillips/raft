@@ -232,7 +232,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 		Term:    1,
 		Command: []byte("test"),
 	}, LogEntry{
-		Term:    0,
+		Term:    3,
 		Command: nil,
 	})
 
@@ -247,7 +247,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 				Command: []byte("test2"),
 			},
 		},
-		LeaderCommit: 1,
+		LeaderCommit: 2,
 	}
 
 	result := &AppendEntriesResponse{}
