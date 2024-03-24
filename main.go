@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RiverPhillips/raft/raft"
+	_ "go.uber.org/automaxprocs"
 	_ "net/http/pprof"
 )
 
@@ -87,37 +88,43 @@ func main() {
 		}
 	}()
 
-	go func() {
-		// Wait for the server to start then dispatch a single command
-		time.Sleep(3 * time.Second)
+	go func(ctx context.Context) {
+		ticker := time.NewTicker(time.Millisecond * 20)
+		defer ticker.Stop()
 
-		if raftServer.State() == raft.Leader {
-			slog.Info("Dispatching command to raft server")
+		for {
+			select {
+			case <-ticker.C:
+				if raftServer.State() == raft.Leader {
 
-			setCmd := kv.SetCommand{Key: "test", Value: "foo"}
-			_, err := raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
-			if err != nil && err.Error() != "not the leader" {
-				panic(err)
+					slog.Info("Dispatching command to raft server")
+
+					setCmd := kv.SetCommand{Key: "test", Value: "foo"}
+					_, err := raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
+					if err != nil && err.Error() != "not the leader" {
+						panic(err)
+					}
+
+					// Dispatch a command to the state machine
+					setCmd = kv.SetCommand{Key: "test", Value: "test"}
+					_, err = raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
+					if err != nil && err.Error() != "not the leader" {
+						panic(err)
+					}
+
+					getCmd := kv.GetCommand{Key: "test"}
+					result, err := raftServer.ApplyCommand(raft.Command(getCmd.Serialize()))
+					if err != nil && err.Error() != "not the leader" {
+						panic(err)
+					}
+
+					slog.Info("Result of get command", "result", string(result[0]))
+				}
+			case <-ctx.Done():
+				return
 			}
-
-			// Dispatch a command to the state machine
-			setCmd = kv.SetCommand{Key: "test", Value: "test"}
-			_, err = raftServer.ApplyCommand(raft.Command(setCmd.Serialize()))
-			if err != nil && err.Error() != "not the leader" {
-				panic(err)
-			}
-
-			getCmd := kv.GetCommand{Key: "test"}
-			result, err := raftServer.ApplyCommand(raft.Command(getCmd.Serialize()))
-			if err != nil && err.Error() != "not the leader" {
-				panic(err)
-			}
-
-			slog.Info("Result of get command", "result", string(result[0]))
-			canc()
 		}
-
-	}()
+	}(ctx)
 
 	if err := raftServer.Start(ctx); err != nil {
 		slog.Error("failed to start server", "error", err)

@@ -7,6 +7,12 @@ services:
     command: -id=1
     ports:
       - "8081:8080"
+    deploy:
+      resources:
+        reservations:
+          cpus: "2"
+        limits:
+          cpus: 2
   raft-2:
     build: .
     environment:
@@ -14,6 +20,12 @@ services:
     command: -id=2
     ports:
       - "8082:8080"
+    deploy:
+      resources:
+        reservations:
+          cpus: "2"
+        limits:
+          cpus: 2
   raft-3:
     build: .
     environment:
@@ -21,3 +33,9 @@ services:
     command: -id=3
     ports:
       - "8083:8080"
+    deploy:
+      resources:
+        reservations:
+          cpus: "2"
+        limits:
+          cpus: 2

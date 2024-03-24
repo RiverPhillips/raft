@@ -185,9 +185,9 @@ func (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse)
 
 	logLen := len(s.log) - 1
 	logValid := req.LastLogTerm > s.log[logLen].Term || req.LastLogIndex >= uint64(logLen)
-	grant := req.Term >= s.currentTerm && (s.votedFor == 0 || s.votedFor == req.CandidateID) && logValid
+	grantVote := req.Term >= s.currentTerm && (s.votedFor == 0 || s.votedFor == req.CandidateID) && logValid
 
-	if grant {
+	if grantVote {
 		slog.Debug("Voting for server", "server", req.CandidateID)
 		s.votedFor = req.CandidateID
 		resp.VoteGranted = true
@@ -200,7 +200,6 @@ func (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse)
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	s.state = Follower
 	// todo: Load state from disk
 
 	slog.Debug("Starting server as Follower")
@@ -242,7 +241,6 @@ func (s *Server) Start(ctx context.Context) error {
 		case <-s.heartbeatTicker.C:
 			s.mu.Lock()
 			if s.state != Leader {
-				s.mu.Unlock()
 				panic("Only leaders should be sending heartbeats")
 			}
 			s.mu.Unlock()
@@ -253,7 +251,7 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
-	slog.Info("Received command", "commands", len(cmds))
+	slog.Debug("Received command", "commands", len(cmds))
 	s.mu.Lock()
 
 	if s.state != Leader {
@@ -286,7 +284,6 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 
 		go func() {
 			// Todo: Add a limit to the number of entries that can be sent in a single RPC
-
 			// Todo: This retry loop should have an exponential backoff or something
 			for {
 				s.mu.Lock()
@@ -295,7 +292,8 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 				prevLogTerm := s.log[prevLogIndex].Term
 
 				var entries []LogEntry
-				if uint64(len(s.log)-1) >= next {
+				logLen := uint64(len(s.log) - 1)
+				if logLen >= next {
 					entries = s.log[next:]
 				}
 
@@ -313,25 +311,22 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 				err := s.makeRpcCall(member, "Server.AppendEntries", req, resp)
 				if err != nil {
 					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", resp.Success)
-				} else if resp.Term > s.currentTerm {
-					slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
-					s.mu.Lock()
-					s.currentTerm = resp.Term
-					s.state = Follower
-					s.votedFor = 0
-					s.leader = s.getMemberById(member.Id)
-					s.resetElectionTimer()
-					s.mu.Unlock()
-				} else if !resp.Success {
+				}
+
+				if s.checkResponseTerm(resp.Term) {
+					break
+				}
+
+				if !resp.Success {
 					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", resp.Term, "leaderTerm", s.currentTerm)
-					member.nextIndex--
-					if member.nextIndex < 0 {
+					if member.nextIndex == 0 {
 						slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
 						panic("Follower is missing entries and Leader has no more entries to send")
 					}
+					member.nextIndex--
 				} else {
 					s.mu.Lock()
-					s.commitIndex = uint64(len(s.log) - 1)
+					s.commitIndex = logLen
 					member.nextIndex++
 					member.matchIndex = s.commitIndex
 					s.mu.Unlock()
@@ -354,11 +349,13 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 }
 
 func (s *Server) requestVoteFromMember(member *ClusterMember) {
-	slog.Debug("Requesting vote from server", "server", member.Id)
-
 	s.mu.Lock()
+	slog.Debug("Requesting vote from server", "server", member.Id)
 	logLen := uint64(len(s.log) - 1)
-	lastLogTerm := s.log[len(s.log)-1].Term
+	lastLogTerm := Term(0)
+	if logLen > 0 {
+		lastLogTerm = s.log[logLen-1].Term
+	}
 
 	req := &RequestVoteRequest{
 		Term:         s.currentTerm,
@@ -384,7 +381,7 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 	}
 
 	if resp.Term != req.Term {
-		// This is an invalid response - no o
+		// This is an invalid response - no op
 		return
 	}
 
@@ -454,36 +451,43 @@ func (s *Server) sendHeartbeat() {
 		}
 		go func(member *ClusterMember) {
 			resp := &AppendEntriesResponse{}
-			term := Term(0)
 			s.mu.Lock()
-			if s.log != nil && len(s.log) > 0 {
-				term = s.log[len(s.log)-1].Term
-			}
-			s.mu.Unlock()
-			err := s.makeRpcCall(member, "Server.AppendEntries", &AppendEntriesRequest{
+
+			prevLogIndex := uint64(len(s.log) - 1)
+			prevLogTerm := s.log[prevLogIndex].Term
+
+			req := &AppendEntriesRequest{
 				Term:         s.currentTerm,
 				LeaderID:     s.id,
-				PrevLogIndex: uint64(len(s.log) - 1),
-				PrevLogTerm:  term,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
 				Entries:      []LogEntry{},
-			}, resp)
+			}
+			s.mu.Unlock()
 
+			err := s.makeRpcCall(member, "Server.AppendEntries", req, resp)
 			if err != nil {
 				slog.Error("Error sending heartbeat", "error", err)
 				return
 			}
 
-			if resp.Term > s.currentTerm {
-				slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
-				s.mu.Lock()
-				defer s.mu.Unlock()
-				s.currentTerm = resp.Term
-				s.state = Follower
-				s.votedFor = 0
-				s.resetElectionTimer()
-			}
+			_ = s.checkResponseTerm(resp.Term)
 		}(member)
 	}
+}
+
+func (s *Server) checkResponseTerm(respTerm Term) bool {
+	if respTerm > s.currentTerm {
+		slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.currentTerm = respTerm
+		s.state = Follower
+		s.votedFor = 0
+		s.resetElectionTimer()
+		return true
+	}
+	return false
 }
 
 func (s *Server) makeRpcCall(member *ClusterMember, methodName string, req any, resp any) error {
