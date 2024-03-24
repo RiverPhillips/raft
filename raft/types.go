@@ -1,7 +1,7 @@
 package raft
 
 import (
-	"net/rpc"
+	"github.com/RiverPhillips/raft/gen/proto/raft/v1/raftv1connect"
 )
 
 type Term uint64
@@ -9,32 +9,6 @@ type Term uint64
 type LogEntry struct {
 	Term    Term
 	Command Command
-}
-
-type AppendEntriesRequest struct {
-	Term         Term
-	LeaderID     memberId
-	PrevLogIndex uint64
-	PrevLogTerm  Term
-	Entries      []LogEntry
-	LeaderCommit uint64
-}
-
-type AppendEntriesResponse struct {
-	Term    Term
-	Success bool
-}
-
-type RequestVoteRequest struct {
-	Term         Term
-	CandidateID  memberId
-	LastLogIndex uint64
-	LastLogTerm  Term
-}
-
-type RequestVoteResponse struct {
-	Term        Term
-	VoteGranted bool
 }
 
 type ServerState uint16
@@ -45,26 +19,26 @@ const (
 	Candidate
 )
 
-type memberId uint16
+type MemberId uint32
 
-func NewMemberId(id uint16) memberId {
+func NewMemberId(id uint32) MemberId {
 	if id < 1 {
 		panic("Member ID must be an integer greater than 0")
 	}
-	return memberId(id)
+	return MemberId(id)
 }
 
 type ClusterMember struct {
-	Id         memberId
-	rpcClient  *rpc.Client
+	Id         MemberId
+	rpcClient  raftv1connect.RaftServiceClient
 	Addr       string
-	votedFor   memberId
+	votedFor   MemberId
 	nextIndex  uint64
 	matchIndex uint64
 }
 
 type NotLeaderError struct {
-	LeaderId   memberId
+	LeaderId   MemberId
 	LeaderAddr string
 }
 

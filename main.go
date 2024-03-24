@@ -5,10 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/RiverPhillips/raft/gen/proto/raft/v1/raftv1connect"
 	"github.com/RiverPhillips/raft/kv"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"log/slog"
 	"net/http"
-	"net/rpc"
 	"os"
 	"os/signal"
 	"regexp"
@@ -58,26 +60,24 @@ func main() {
 			os.Exit(1)
 		}
 		members = append(members, &raft.ClusterMember{
-			Id:   raft.NewMemberId(uint16(id)),
+			Id:   raft.NewMemberId(uint32(id)),
 			Addr: ss[1],
 		})
 	}
 
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
 	slog.SetDefault(slog.New(h))
 
 	sm := kv.NewKvStateMachine()
 
-	raftServer := raft.NewServer(raft.NewMemberId(uint16(*memberIDFlag)), sm, members)
+	raftServer := raft.NewServer(raft.NewMemberId(uint32(*memberIDFlag)), sm, members)
 
-	if err := rpc.Register(raftServer); err != nil {
-		slog.Error("failed to register rpc", "error", err)
-		os.Exit(1)
-	}
-	rpc.HandleHTTP()
+	mux := http.DefaultServeMux
+	mux.Handle(raftv1connect.NewRaftServiceHandler(raftServer))
 
+	h2Srv := &http2.Server{}
 	srv := &http.Server{
-		Handler: http.DefaultServeMux,
+		Handler: h2c.NewHandler(mux, h2Srv),
 		Addr:    fmt.Sprintf(":%d", *portFlag),
 	}
 

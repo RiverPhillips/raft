@@ -2,11 +2,15 @@
 package raft
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"crypto/rand"
+	"fmt"
+	v1 "github.com/RiverPhillips/raft/gen/proto/raft/v1"
+	"github.com/RiverPhillips/raft/gen/proto/raft/v1/raftv1connect"
 	"log/slog"
 	"math/big"
-	"net/rpc"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -17,8 +21,10 @@ const (
 )
 
 type Server struct {
+	raftv1connect.UnimplementedRaftServiceHandler
+
 	mu              sync.Mutex
-	id              memberId
+	id              MemberId
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
 
@@ -26,7 +32,7 @@ type Server struct {
 
 	// Persistent state on all servers
 	currentTerm Term
-	votedFor    memberId
+	votedFor    MemberId
 	log         []LogEntry // This is indexed from 1
 
 	// Volatile state on all servers
@@ -47,7 +53,7 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(minElectionTimeout+r.Int64())
 }
 
-func NewServer(id memberId, sm StateMachine, members []*ClusterMember) *Server {
+func NewServer(id MemberId, sm StateMachine, members []*ClusterMember) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
 	}
@@ -58,6 +64,14 @@ func NewServer(id memberId, sm StateMachine, members []*ClusterMember) *Server {
 
 	hbTicker := time.NewTicker(heartbeatTimeout)
 	hbTicker.Stop()
+
+	for _, member := range members {
+		member.rpcClient = raftv1connect.NewRaftServiceClient(
+			http.DefaultClient, // Todo - pass in a custom client
+			fmt.Sprintf("http://%s", member.Addr),
+			connect.WithGRPC(),
+		)
+	}
 
 	return &Server{
 		state:           Follower,
@@ -71,12 +85,15 @@ func NewServer(id memberId, sm StateMachine, members []*ClusterMember) *Server {
 }
 
 // AppendEntries is an RPC method that is called by the Leader to replicate log entries
-func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesResponse) error {
+func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.AppendEntriesRequest]) (*connect.Response[v1.AppendEntriesResponse], error) {
 	// 1. Reply false if Term < currentTerm
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	req := connReq.Msg
 
-	s.updateTerm(req.Term)
+	s.updateTerm(Term(req.Term))
+
+	resp := &v1.AppendEntriesResponse{}
 
 	// If AppendEntries RPC received from new Leader: convert to Follower
 	if s.state == Candidate {
@@ -88,38 +105,45 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 		panic("Only followers should be receiving append entries")
 	}
 
-	if s.leader == nil || req.LeaderID != s.leader.Id {
-		s.leader = s.getMemberById(req.LeaderID)
+	leaderId := NewMemberId(req.LeaderId)
+
+	if s.leader == nil || leaderId != s.leader.Id {
+		s.leader = s.getMemberById(leaderId)
 	}
 
-	resp.Term = s.currentTerm
+	resp.Term = uint64(s.currentTerm)
 	resp.Success = false
 
 	// Reply false if term < currentTerm
-	if req.Term < s.currentTerm {
+	if Term(req.Term) < s.currentTerm {
 		// This is a stale request from an old Leader
-		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "Leader", req.LeaderID)
-		return nil
+		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "Leader", req.LeaderId)
+		return connect.NewResponse(resp), nil
 	}
 
 	// We have a valid Leader
 	s.resetElectionTimer()
 
-	slog.Debug("Received append entries request from valid Leader", "server", s.id, "term", req.Term, "Leader", req.LeaderID, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", req.PrevLogTerm, "entries", len(req.Entries))
+	prevLogTerm := Term(req.PrevLogTerm)
+	slog.Debug("Received append entries request from valid Leader", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", prevLogTerm, "entries", len(req.Entries))
 
 	// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm
 	logLen := uint64(len(s.log))
-	validLog := req.PrevLogIndex == 0 || (req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == req.PrevLogTerm)
+	validLog := req.PrevLogIndex == 0 || (req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == prevLogTerm)
 
 	if !validLog {
-		slog.Debug("Rejecting append entries request. Log was not valid", "server", s.id, "term", req.Term, "Leader", req.LeaderID, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", req.PrevLogTerm, "logLength", logLen)
-		return nil
+		slog.Debug("Rejecting append entries request. Log was not valid", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", prevLogTerm, "logLength", logLen)
+		return connect.NewResponse(resp), nil
 	}
 
 	nextIdx := req.PrevLogIndex + 1
 
 	for i := nextIdx; i < nextIdx+uint64(len(req.Entries)); i++ {
-		entry := req.Entries[i-nextIdx]
+		ent := req.Entries[i-nextIdx]
+		entry := LogEntry{
+			Term:    Term(ent.Term),
+			Command: ent.Command,
+		}
 		if i >= uint64(cap(s.log)) {
 			// We're at the capacity of the log let's increase the capacity
 			newLen := nextIdx + uint64(len(req.Entries))
@@ -128,10 +152,10 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 			s.log = newLog
 		} else if logLen > i && s.log[i].Term != entry.Term {
 			s.log = s.log[:i]
-			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderID, "index", i, "logLength", len(s.log))
+			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.log))
 		}
 
-		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "Leader", req.LeaderID, "index", i, "logLength", len(s.log))
+		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.log))
 		if i < uint64(len(s.log)) {
 			slog.Debug("Log is unchanged")
 		} else {
@@ -147,7 +171,7 @@ func (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesRes
 
 	resp.Success = true
 
-	return nil
+	return connect.NewResponse(resp), nil
 }
 
 // Must be called with the lock held
@@ -169,34 +193,40 @@ func (s *Server) resetElectionTimer() {
 }
 
 // RequestVote is an RPC method that is called by candidates to gather votes
-func (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse) error {
-	slog.Info("Received request for vote", "server", s.id, "term", req.Term, "Candidate", req.CandidateID)
+func (s *Server) RequestVote(ctx context.Context, connReq *connect.Request[v1.RequestVoteRequest]) (*connect.Response[v1.RequestVoteResponse], error) {
+	req := connReq.Msg
+	reqTerm := Term(req.Term)
+	candidateId := MemberId(req.CandidateId)
+	slog.Info("Received request for vote", "server", s.id, "term", reqTerm, "Candidate", candidateId)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateTerm(req.Term)
+	s.updateTerm(reqTerm)
 
-	resp.Term = s.currentTerm
+	resp := &v1.RequestVoteResponse{}
+
+	resp.Term = uint64(s.currentTerm)
 	resp.VoteGranted = false
 
-	if req.Term < s.currentTerm {
-		slog.Debug("Rejecting vote request. Term not valid", "server", s.id, "term", req.Term, "Candidate", req.CandidateID, "currentTerm", s.currentTerm)
-		return nil
+	if reqTerm < s.currentTerm {
+		slog.Debug("Rejecting vote request. Term not valid", "server", s.id, "term", reqTerm, "Candidate", candidateId, "currentTerm", s.currentTerm)
+		return connect.NewResponse(resp), nil
 	}
 
 	logLen := len(s.log) - 1
-	logValid := req.LastLogTerm > s.log[logLen].Term || req.LastLogIndex >= uint64(logLen)
-	grantVote := req.Term >= s.currentTerm && (s.votedFor == 0 || s.votedFor == req.CandidateID) && logValid
+	lastLogTerm := Term(req.LastLogTerm)
+	logValid := lastLogTerm > s.log[logLen].Term || req.LastLogIndex >= uint64(logLen)
+	grantVote := reqTerm >= s.currentTerm && (s.votedFor == 0 || s.votedFor == candidateId) && logValid
 
 	if grantVote {
-		slog.Debug("Voting for server", "server", req.CandidateID)
-		s.votedFor = req.CandidateID
+		slog.Debug("Voting for server", "server", candidateId)
+		s.votedFor = candidateId
 		resp.VoteGranted = true
 		s.resetElectionTimer()
-		return nil
+		return connect.NewResponse(resp), nil
 	} else {
-		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", req.Term, "Candidate", req.CandidateID, "votedFor", s.votedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
+		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.votedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
 	}
-	return nil
+	return connect.NewResponse(resp), nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -282,7 +312,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 			continue
 		}
 
-		go func() {
+		go func(member *ClusterMember) {
 			// Todo: Add a limit to the number of entries that can be sent in a single RPC
 			// Todo: This retry loop should have an exponential backoff or something
 			for {
@@ -291,34 +321,41 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 				prevLogIndex := next - 1
 				prevLogTerm := s.log[prevLogIndex].Term
 
-				var entries []LogEntry
+				var entries []*v1.LogEntry
 				logLen := uint64(len(s.log) - 1)
 				if logLen >= next {
-					entries = s.log[next:]
+					for _, e := range s.log[next:] {
+						entries = append(entries, &v1.LogEntry{
+							Term:    uint64(e.Term),
+							Command: e.Command,
+						})
+					}
 				}
 
-				req := &AppendEntriesRequest{
-					Term:         s.currentTerm,
-					LeaderID:     s.id,
+				req := &v1.AppendEntriesRequest{
+					Term:         uint64(s.currentTerm),
+					LeaderId:     uint32(s.id),
 					LeaderCommit: s.commitIndex,
 					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  prevLogTerm,
+					PrevLogTerm:  uint64(prevLogTerm),
 					Entries:      entries,
 				}
 				s.mu.Unlock()
 
-				resp := &AppendEntriesResponse{}
-				err := s.makeRpcCall(member, "Server.AppendEntries", req, resp)
+				connResp, err := member.rpcClient.AppendEntries(context.Background(), connect.NewRequest(req))
 				if err != nil {
-					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", resp.Success)
+					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", connResp.Msg.Success)
 				}
 
-				if s.checkResponseTerm(resp.Term) {
+				resp := connResp.Msg
+
+				term := Term(resp.Term)
+				if s.checkResponseTerm(term) {
 					break
 				}
 
 				if !resp.Success {
-					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", resp.Term, "leaderTerm", s.currentTerm)
+					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.currentTerm)
 					if member.nextIndex == 0 {
 						slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
 						panic("Follower is missing entries and Leader has no more entries to send")
@@ -335,7 +372,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 				}
 			}
 			wg.Done()
-		}()
+		}(member)
 	}
 	// Wait for a quorum of servers to confirm the entry
 	wg.Wait()
@@ -357,26 +394,29 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 		lastLogTerm = s.log[logLen-1].Term
 	}
 
-	req := &RequestVoteRequest{
-		Term:         s.currentTerm,
-		CandidateID:  s.id,
+	req := &v1.RequestVoteRequest{
+		Term:         uint64(s.currentTerm),
+		CandidateId:  uint32(s.id),
 		LastLogIndex: logLen,
-		LastLogTerm:  lastLogTerm,
+		LastLogTerm:  uint64(lastLogTerm),
 	}
 
 	s.mu.Unlock()
 
-	resp := &RequestVoteResponse{}
-	if err := s.makeRpcCall(member, "Server.RequestVote", req, resp); err != nil {
+	connResp, err := member.rpcClient.RequestVote(context.TODO(), connect.NewRequest(req))
+	if err != nil {
 		slog.Error("Error requesting vote", "member", member.Id, "error", err)
 		// This will be retried on the next election timer tick
 		return
 	}
 	s.mu.Lock()
+
+	resp := connResp.Msg
+
 	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
 
-	if s.updateTerm(resp.Term) {
+	if s.updateTerm(Term(resp.Term)) {
 		return
 	}
 
@@ -450,28 +490,27 @@ func (s *Server) sendHeartbeat() {
 			continue
 		}
 		go func(member *ClusterMember) {
-			resp := &AppendEntriesResponse{}
 			s.mu.Lock()
 
 			prevLogIndex := uint64(len(s.log) - 1)
 			prevLogTerm := s.log[prevLogIndex].Term
 
-			req := &AppendEntriesRequest{
-				Term:         s.currentTerm,
-				LeaderID:     s.id,
+			req := &v1.AppendEntriesRequest{
+				Term:         uint64(s.currentTerm),
+				LeaderId:     uint32(s.id),
 				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      []LogEntry{},
+				PrevLogTerm:  uint64(prevLogTerm),
+				Entries:      []*v1.LogEntry{},
 			}
 			s.mu.Unlock()
 
-			err := s.makeRpcCall(member, "Server.AppendEntries", req, resp)
+			resp, err := member.rpcClient.AppendEntries(context.TODO(), connect.NewRequest(req))
 			if err != nil {
 				slog.Error("Error sending heartbeat", "error", err)
 				return
 			}
 
-			_ = s.checkResponseTerm(resp.Term)
+			_ = s.checkResponseTerm(Term(resp.Msg.Term))
 		}(member)
 	}
 }
@@ -490,29 +529,7 @@ func (s *Server) checkResponseTerm(respTerm Term) bool {
 	return false
 }
 
-func (s *Server) makeRpcCall(member *ClusterMember, methodName string, req any, resp any) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var err error
-	if member.rpcClient == nil {
-		member.rpcClient, err = rpc.DialHTTP("tcp", member.Addr)
-		if err != nil {
-			slog.Warn("Error dialing member", "error", err, "member", member.Id)
-			return err
-		}
-	}
-
-	err = member.rpcClient.Call(methodName, req, resp)
-	if err != nil {
-		slog.Warn("Error calling rpc", "error", err, "member", member.Id)
-		return err
-	}
-
-	return nil
-}
-
-func (s *Server) getMemberById(id memberId) *ClusterMember {
+func (s *Server) getMemberById(id MemberId) *ClusterMember {
 	// Todo: Do we need a map or is it so small it's irrelevant?
 	for _, member := range s.clusterMembers {
 		if member.Id == id {
