@@ -1,0 +1,115 @@
+Index: raft/server.go
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>// Package raft server implementation\npackage raft\n\nimport (\n\t\"context\"\n\t\"log/slog\"\n\t\"math/rand\"\n\t\"net/rpc\"\n\t\"sync\"\n\t\"time\"\n)\n\nconst (\n\theartbeatTimeout   = time.Millisecond * 500\n\tminElectionTimeout = 1500\n)\n\ntype Server struct {\n\tmu              sync.Mutex\n\tid              memberId\n\telectionTicker  *time.Ticker\n\theartbeatTicker *time.Ticker\n\n\tclusterMembers []*ClusterMember\n\n\t// Persistent state on all servers\n\tcurrentTerm Term\n\tvotedFor    memberId\n\tlog         []LogEntry // This is indexed from 1\n\n\t// Volatile state on all servers\n\tcommitIndex uint64\n\tlastApplied uint64\n\tstate       serverState\n\n\t// Volatile state on leaders\n\tnextIndex  []int\n\tmatchIndex []int\n}\n\nfunc getElectionTimeout() time.Duration {\n\treturn time.Millisecond * time.Duration(minElectionTimeout+rand.Intn(150))\n}\n\nfunc NewServer(id memberId, members []*ClusterMember) *Server {\n\tif id < 1 {\n\t\tpanic(\"Server ID must be an integer greater than 0\")\n\t}\n\n\tif len(members)%2 == 0 {\n\t\tpanic(\"Cluster must have an odd number of members\")\n\t}\n\n\thbTicker := time.NewTicker(heartbeatTimeout)\n\thbTicker.Stop()\n\n\treturn &Server{\n\t\tstate:           follower,\n\t\tid:              id,\n\t\telectionTicker:  time.NewTicker(getElectionTimeout()),\n\t\theartbeatTicker: hbTicker,\n\t\tclusterMembers:  members,\n\t\tlog:             []LogEntry{{}}, // Todo: Load from disk\n\t}\n}\n\n// AppendEntries is an RPC method that is called by the leader to replicate log entries\nfunc (s *Server) AppendEntries(req *AppendEntriesRequest, resp *AppendEntriesResponse) error {\n\t// 1. Reply false if Term < currentTerm\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\n\tif req.Term < s.currentTerm {\n\t\t// This is a stale request from an old leader\n\t\tresp.Term = s.currentTerm\n\t\ts.mu.Unlock()\n\t\tresp.Success = false\n\t\treturn nil\n\t}\n\n\ts.resetElectionTimer()\n\n\t// If RPC request or response contains Term T >= currentTerm: set currentTerm = T, convert to follower\n\tif req.Term >= s.currentTerm && s.state == candidate {\n\t\ts.state = follower\n\t\ts.currentTerm = req.Term\n\t\ts.votedFor = 0\n\t\tslog.Debug(\"Transitioning to follower\", \"Term\", s.currentTerm)\n\t}\n\n\t// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm\n\tlogLen := uint64(len(s.log) - 1)\n\tif (logLen) < req.PrevLogIndex || s.log[req.PrevLogIndex].Term != req.PrevLogTerm {\n\t\tresp.Term = s.currentTerm\n\t\ts.mu.Unlock()\n\t\tresp.Success = false\n\t\treturn nil\n\t}\n\n\t// 3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it\n\tif logLen > req.PrevLogIndex+1 {\n\t\ts.log = s.log[:req.PrevLogIndex+1]\n\t}\n\n\t// 4. Append any new entries not already in the log\n\t// Check which entries are new\n\n\tif req.LeaderCommit > s.commitIndex {\n\t\ts.commitIndex = min(req.LeaderCommit, logLen)\n\t}\n\n\tresp.Term = s.currentTerm\n\tresp.Success = true\n\n\treturn nil\n}\n\n// Must be called with the lock held\nfunc (s *Server) resetElectionTimer() {\n\ts.electionTicker.Reset(getElectionTimeout())\n}\n\n// RequestVote is an RPC method that is called by candidates to gather votes\nfunc (s *Server) RequestVote(req *RequestVoteRequest, resp *RequestVoteResponse) error {\n\tslog.Info(\"Received request for vote\", \"server\", s.id, \"term\", req.Term, \"candidate\", req.CandidateID)\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\n\tif req.Term > s.currentTerm {\n\t\ts.currentTerm = req.Term\n\t\ts.state = follower\n\t\ts.votedFor = 0\n\t\ts.resetElectionTimer()\n\t}\n\n\tresp.Term = s.currentTerm\n\tresp.VoteGranted = false\n\n\tif req.Term < s.currentTerm {\n\t\tslog.Debug(\"Rejecting vote request. Term not valid\", \"server\", s.id, \"term\", req.Term, \"candidate\", req.CandidateID, \"currentTerm\", s.currentTerm)\n\t\treturn nil\n\t}\n\n\tlogLen := len(s.log) - 1\n\tlogValid := req.LastLogTerm > s.log[logLen].Term || req.LastLogIndex >= uint64(logLen)\n\tgrant := req.Term == s.currentTerm && (s.votedFor == 0 || s.votedFor == req.CandidateID) && logValid\n\n\tif grant {\n\t\tslog.Debug(\"Voting for server\", \"server\", req.CandidateID)\n\t\ts.votedFor = req.CandidateID\n\t\tresp.VoteGranted = true\n\t\ts.resetElectionTimer()\n\t\treturn nil\n\t} else {\n\t\tslog.Debug(\"Rejecting vote request. Log was not up to date enough\", \"server\", s.id, \"term\", req.Term, \"candidate\", req.CandidateID, \"votedFor\", s.votedFor, \"lastLogIndex\", req.LastLogIndex, \"logLength\", logLen)\n\t}\n\treturn nil\n}\n\nfunc (s *Server) Start(ctx context.Context) error {\n\ts.state = follower\n\n\t// todo: Load state from disk\n\n\tslog.Debug(\"Starting server as follower\")\n\n\t// Start the election timer\n\t// If the election timer elapses without receiving AppendEntries RPC from the current leader or granting a vote to another candidate, convert to candidate\n\n\tfor {\n\t\tselect {\n\t\tcase <-ctx.Done():\n\t\t\tslog.Debug(\"Shutting down raft server\")\n\t\t\treturn nil\n\t\tcase <-s.electionTicker.C:\n\t\t\tif s.state == leader {\n\t\t\t\t// If we're the leader we shouldn't be running an election timer\n\t\t\t\t// Something has gone wrong\n\t\t\t\tpanic(\"Leader running election timer\")\n\t\t\t}\n\n\t\t\tslog.Debug(\"Election timer elapsed, transitioning to candidate\")\n\t\t\ts.mu.Lock()\n\t\t\ts.state = candidate\n\t\t\ts.currentTerm++\n\t\t\ts.votedFor = s.id\n\t\t\ts.mu.Unlock()\n\n\t\t\tfor _, member := range s.clusterMembers {\n\t\t\t\tmember.votedFor = 0\n\t\t\t\tif member.Id == s.id {\n\t\t\t\t\t// Vote for ourselves, we don't need to send a request to ourselves\n\t\t\t\t\tmember.votedFor = s.id\n\t\t\t\t\ts.resetElectionTimer()\n\t\t\t\t\tcontinue\n\t\t\t\t}\n\n\t\t\t\tgo s.requestVoteFromMember(member)\n\t\t\t}\n\t\t\ts.checkIfElected()\n\n\t\t\t// Send RequestVote RPCs to all other servers\n\t\t\t// If votes received from a quorum of servers: become leader\n\t\tcase <-s.heartbeatTicker.C:\n\t\t\tif s.state != leader {\n\t\t\t\tpanic(\"Only leaders should be sending heartbeats\")\n\t\t\t}\n\t\t\tslog.Debug(\"Sending heartbeat\")\n\t\t\ts.sendHeartbeat()\n\t\t}\n\t}\n}\n\nfunc (s *Server) requestVoteFromMember(member *ClusterMember) {\n\tslog.Debug(\"Requesting vote from server\", \"server\", member.Id)\n\n\tlogLen := uint64(len(s.log) - 1)\n\n\treq := &RequestVoteRequest{\n\t\tTerm:         s.currentTerm,\n\t\tCandidateID:  s.id,\n\t\tLastLogIndex: logLen,\n\t}\n\n\tresp := &RequestVoteResponse{}\n\tif err := s.makeRpcCall(member, \"Server.RequestVote\", req, resp); err != nil {\n\t\tslog.Error(\"Error requesting vote\", \"member\", member.Id, \"error\", err)\n\t\t// This will be retried on the next election timer tick\n\t\treturn\n\t}\n\n\tslog.Debug(\"Received vote response\", \"server\", member.Id, \"voteGranted\", resp.VoteGranted, \"term\", resp.Term)\n\n\t// If RPC request or response contains Term T > currentTerm: set currentTerm = T, convert to follower\n\tif resp.Term > s.currentTerm {\n\t\ts.mu.Lock()\n\t\tdefer s.mu.Unlock()\n\t\ts.currentTerm = resp.Term\n\t\ts.state = follower\n\t\ts.votedFor = 0\n\t\ts.resetElectionTimer()\n\t\tslog.Debug(\"Transitioning to follower\", \"Term\", s.currentTerm)\n\t\t// Todo: update state on disk\n\t\treturn\n\t}\n\n\tif resp.Term != req.Term {\n\t\t// This is a stale response - no op\n\t\treturn\n\t}\n\n\tif resp.VoteGranted {\n\t\tslog.Debug(\"Received vote from server\", \"server\", member.Id)\n\t\tmember.votedFor = s.id\n\t\ts.checkIfElected()\n\t}\n}\n\nfunc (s *Server) checkIfElected() {\n\tif s.state == candidate {\n\t\t// If we're a candidate we need to check if we've received a majority of votes\n\t\t// If we have, we become the leader\n\n\t\tquorum := (len(s.clusterMembers) + 1) / 2\n\t\tslog.Debug(\"Checking if elected\", \"quorumSize\", quorum)\n\t\tvotesReceived := 0\n\t\ts.mu.Lock()\n\t\tdefer s.mu.Unlock()\n\t\tfor _, member := range s.clusterMembers {\n\t\t\tif member.votedFor == s.id {\n\t\t\t\tvotesReceived++\n\t\t\t}\n\t\t\tif votesReceived == quorum {\n\t\t\t\tslog.Debug(\"Received quorum of votes, transitioning to leader\")\n\t\t\t\ts.state = leader\n\t\t\t\ts.electionTicker.Stop()\n\t\t\t\ts.heartbeatTicker.Reset(heartbeatTimeout)\n\n\t\t\t\ts.initializeVolatileLeaderState()\n\n\t\t\t\t// Send initial empty AppendEntries RPCs to all other servers\n\t\t\t\t// Include the Term in the RPC\n\t\t\t\t// If followers are up-to-date, they will respond with success\n\t\t\t\ts.sendHeartbeat()\n\t\t\t} else {\n\t\t\t\tslog.Debug(\"Not enough votes yet\", \"quorumSize\", quorum, \"votesReceived\", votesReceived)\n\t\t\t}\n\t\t}\n\t}\n}\n\nfunc (s *Server) initializeVolatileLeaderState() {\n\t// NextIndex for each server is initialized to the leader's last log index + 1\n\ts.nextIndex = make([]int, len(s.clusterMembers))\n\tfor i := range s.nextIndex {\n\t\ts.nextIndex[i] = len(s.log)\n\t}\n\t// MatchIndex for each server is initialized to 0\n\t// This is the highest index in the leader's log that the follower has confirmed is replicated\n\ts.matchIndex = make([]int, len(s.clusterMembers))\n}\n\nfunc (s *Server) sendHeartbeat() {\n\tfor _, member := range s.clusterMembers {\n\t\tif member.Id == s.id {\n\t\t\tcontinue\n\t\t}\n\t\tgo func(member *ClusterMember) {\n\t\t\tresp := &AppendEntriesResponse{}\n\t\t\tterm := Term(0)\n\t\t\tif s.log != nil && len(s.log) > 0 {\n\t\t\t\tterm = s.log[len(s.log)-1].Term\n\t\t\t}\n\t\t\terr := s.makeRpcCall(member, \"Server.AppendEntries\", &AppendEntriesRequest{\n\t\t\t\tTerm:         s.currentTerm,\n\t\t\t\tLeaderID:     s.id,\n\t\t\t\tPrevLogIndex: uint64(len(s.log) - 1),\n\t\t\t\tPrevLogTerm:  term,\n\t\t\t\tEntries:      []LogEntry{},\n\t\t\t}, resp)\n\n\t\t\tif err != nil {\n\t\t\t\tslog.Error(\"Error sending heartbeat\", \"error\", err)\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\tif resp.Term > s.currentTerm {\n\t\t\t\tslog.Debug(\"Transitioning to follower\", \"Term\", s.currentTerm)\n\n\t\t\t\ts.mu.Lock()\n\t\t\t\tdefer s.mu.Unlock()\n\t\t\t\ts.currentTerm = resp.Term\n\t\t\t\ts.state = follower\n\t\t\t\ts.votedFor = 0\n\t\t\t\ts.resetElectionTimer()\n\t\t\t}\n\t\t}(member)\n\t}\n}\n\nfunc (s *Server) makeRpcCall(member *ClusterMember, methodName string, req any, resp any) error {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\n\tvar err error\n\tif member.rpcClient == nil {\n\t\tmember.rpcClient, err = rpc.DialHTTP(\"tcp\", member.Addr)\n\t\tif err != nil {\n\t\t\tslog.Warn(\"Error dialing member\", \"error\", err, \"member\", member.Id)\n\t\t\treturn err\n\t\t}\n\t}\n\n\terr = member.rpcClient.Call(methodName, req, resp)\n\tif err != nil {\n\t\tslog.Warn(\"Error calling rpc\", \"error\", err, \"member\", member.Id)\n\t\treturn err\n\t}\n\n\treturn nil\n}\n
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/raft/server.go b/raft/server.go
+--- a/raft/server.go	(revision e997edf52ba8bb58ee1ae2b235f2cd29c124b7c9)
++++ b/raft/server.go	(date 1710695245527)
+@@ -11,8 +11,8 @@
+ )
+ 
+ const (
+-	heartbeatTimeout   = time.Millisecond * 500
+-	minElectionTimeout = 1500
++	heartbeatTimeout   = time.Millisecond * 50
++	minElectionTimeout = 150
+ )
+ 
+ type Server struct {
+@@ -70,6 +70,8 @@
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 
++	slog.Debug("Received AppendEntries RPC", "server", s.id, "term", req.Term, "leader", req.LeaderID)
++
+ 	if req.Term < s.currentTerm {
+ 		// This is a stale request from an old leader
+ 		resp.Term = s.currentTerm
+@@ -78,14 +80,8 @@
+ 		return nil
+ 	}
+ 
+-	s.resetElectionTimer()
+-
+-	// If RPC request or response contains Term T >= currentTerm: set currentTerm = T, convert to follower
+-	if req.Term >= s.currentTerm && s.state == candidate {
+-		s.state = follower
+-		s.currentTerm = req.Term
+-		s.votedFor = 0
+-		slog.Debug("Transitioning to follower", "Term", s.currentTerm)
++	if req.Term > s.currentTerm {
++		s.updateTerm(req.Term)
+ 	}
+ 
+ 	// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm
+@@ -127,10 +123,7 @@
+ 	defer s.mu.Unlock()
+ 
+ 	if req.Term > s.currentTerm {
+-		s.currentTerm = req.Term
+-		s.state = follower
+-		s.votedFor = 0
+-		s.resetElectionTimer()
++		s.updateTerm(req.Term)
+ 	}
+ 
+ 	resp.Term = s.currentTerm
+@@ -157,6 +150,14 @@
+ 	return nil
+ }
+ 
++// Must be called with the lock held
++func (s *Server) updateTerm(term Term) {
++	s.currentTerm = term
++	s.state = follower
++	s.votedFor = 0
++	s.resetElectionTimer()
++}
++
+ func (s *Server) Start(ctx context.Context) error {
+ 	s.state = follower
+ 
+@@ -205,7 +206,7 @@
+ 			if s.state != leader {
+ 				panic("Only leaders should be sending heartbeats")
+ 			}
+-			slog.Debug("Sending heartbeat")
++			slog.Debug("Sending heartbeat", "term", s.currentTerm)
+ 			s.sendHeartbeat()
+ 		}
+ 	}
+@@ -235,12 +236,8 @@
+ 	if resp.Term > s.currentTerm {
+ 		s.mu.Lock()
+ 		defer s.mu.Unlock()
+-		s.currentTerm = resp.Term
+-		s.state = follower
+-		s.votedFor = 0
+-		s.resetElectionTimer()
++		s.updateTerm(resp.Term)
+ 		slog.Debug("Transitioning to follower", "Term", s.currentTerm)
+-		// Todo: update state on disk
+ 		return
+ 	}
+ 
+@@ -311,6 +308,9 @@
+ 			if s.log != nil && len(s.log) > 0 {
+ 				term = s.log[len(s.log)-1].Term
+ 			}
++
++			slog.Debug("Sending heartbeat", "member", member.Id)
++
+ 			err := s.makeRpcCall(member, "Server.AppendEntries", &AppendEntriesRequest{
+ 				Term:         s.currentTerm,
+ 				LeaderID:     s.id,
+@@ -333,6 +333,7 @@
+ 				s.state = follower
+ 				s.votedFor = 0
+ 				s.resetElectionTimer()
++				s.heartbeatTicker.Stop()
+ 			}
+ 		}(member)
+ 	}
