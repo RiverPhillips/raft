@@ -28,7 +28,7 @@ type Server struct {
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
 
-	clusterMembers []*ClusterMember
+	clusterMembers map[MemberId]*ClusterMember
 
 	// Persistent state on all servers
 	currentTerm Term
@@ -73,12 +73,18 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember) *Server {
 		)
 	}
 
+	mm := map[MemberId]*ClusterMember{}
+
+	for _, m := range members {
+		mm[m.Id] = m
+	}
+
 	return &Server{
 		state:           Follower,
 		id:              id,
 		electionTicker:  time.NewTicker(getElectionTimeout()),
 		heartbeatTicker: hbTicker,
-		clusterMembers:  members,
+		clusterMembers:  mm,
 		log:             []LogEntry{{}}, // Todo: Load from disk
 		stateMachine:    sm,
 	}
@@ -530,11 +536,8 @@ func (s *Server) checkResponseTerm(respTerm Term) bool {
 }
 
 func (s *Server) getMemberById(id MemberId) *ClusterMember {
-	// Todo: Do we need a map or is it so small it's irrelevant?
-	for _, member := range s.clusterMembers {
-		if member.Id == id {
-			return member
-		}
+	if member, ok := s.clusterMembers[id]; ok {
+		return member
 	}
 	panic("Member not found")
 }

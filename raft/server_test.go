@@ -8,7 +8,30 @@ import (
 	v1 "github.com/RiverPhillips/raft/gen/proto/raft/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 )
+
+func createNewServer() *Server {
+	sm := &NoOpStateMachine{}
+	return NewServer(NewMemberId(1), sm, []*ClusterMember{
+		{
+			Id:   NewMemberId(1),
+			Addr: "one",
+		},
+		{
+			Id:   NewMemberId(2),
+			Addr: "two",
+		},
+		{
+			Id:   NewMemberId(3),
+			Addr: "three",
+		},
+	})
+}
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
 	server := createNewServer()
@@ -29,24 +52,6 @@ func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
 
 	require.Equal(t, uint64(2), msg.Term)
 	require.False(t, msg.VoteGranted)
-}
-
-func createNewServer() *Server {
-	sm := &NoOpStateMachine{}
-	return NewServer(NewMemberId(1), sm, []*ClusterMember{
-		{
-			Id:   NewMemberId(1),
-			Addr: "one",
-		},
-		{
-			Id:   NewMemberId(2),
-			Addr: "two",
-		},
-		{
-			Id:   NewMemberId(3),
-			Addr: "three",
-		},
-	})
 }
 
 func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {

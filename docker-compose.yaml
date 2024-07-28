@@ -12,7 +12,7 @@ services:
         reservations:
           cpus: "2"
         limits:
-          cpus: 2
+          cpus: '2'
   raft-2:
     build: .
     environment:
@@ -25,7 +25,7 @@ services:
         reservations:
           cpus: "2"
         limits:
-          cpus: 2
+          cpus: '2'
   raft-3:
     build: .
     environment:
@@ -38,4 +38,4 @@ services:
         reservations:
           cpus: "2"
         limits:
-          cpus: 2
+          cpus: '2'
