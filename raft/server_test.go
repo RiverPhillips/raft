@@ -4,29 +4,33 @@ import (
 	"context"
 	"testing"
 
-	"connectrpc.com/connect"
-	v1 "github.com/RiverPhillips/raft/gen/proto/raft/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 )
 
+type noopTransport struct{}
+
+func (noopTransport) RequestVote(context.Context, MemberId, *RequestVoteRequest) (*RequestVoteResult, error) {
+	return nil, nil
+}
+func (noopTransport) AppendEntries(context.Context, MemberId, *AppendEntriesRequest) (*AppendEntriesResult, error) {
+	return nil, nil
+}
+
 func createNewServer() *Server {
 	sm := &NoOpStateMachine{}
 	return NewServer(NewMemberId(1), sm, []*ClusterMember{
 		{
-			Id:   NewMemberId(1),
-			Addr: "one",
+			Id: NewMemberId(1),
 		},
 		{
-			Id:   NewMemberId(2),
-			Addr: "two",
+			Id: NewMemberId(2),
 		},
 		{
-			Id:   NewMemberId(3),
-			Addr: "three",
+			Id: NewMemberId(3),
 		},
-	})
+	}, noopTransport{})
 }
 
 func TestMain(m *testing.M) {
@@ -38,20 +42,18 @@ func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
 
 	server.currentTerm = 2
 
-	req := connect.NewRequest(&v1.RequestVoteRequest{
+	req := &RequestVoteRequest{
 		Term:         1,
 		CandidateId:  0,
 		LastLogIndex: 0,
 		LastLogTerm:  0,
-	})
+	}
 
 	res, err := server.RequestVote(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-
-	require.Equal(t, uint64(2), msg.Term)
-	require.False(t, msg.VoteGranted)
+	require.Equal(t, Term(2), res.Term)
+	require.False(t, res.VoteGranted)
 }
 
 func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
@@ -63,20 +65,18 @@ func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
 		Command: []byte("test"),
 	})
 
-	req := connect.NewRequest(&v1.RequestVoteRequest{
+	req := &RequestVoteRequest{
 		Term:         2,
 		CandidateId:  0,
 		LastLogIndex: 0,
 		LastLogTerm:  0,
-	})
+	}
 
 	res, err := server.RequestVote(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-
-	require.Equal(t, uint64(2), msg.Term)
-	require.False(t, msg.VoteGranted)
+	require.Equal(t, Term(2), res.Term)
+	require.False(t, res.VoteGranted)
 }
 
 func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testing.T) {
@@ -84,32 +84,30 @@ func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testin
 
 	server.currentTerm = 0
 
-	req := connect.NewRequest(&v1.RequestVoteRequest{
+	req := &RequestVoteRequest{
 		Term:         1,
 		CandidateId:  1,
 		LastLogIndex: 0,
 		LastLogTerm:  0,
-	})
+	}
 
 	res, err := server.RequestVote(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-
-	assert.Equal(t, uint64(1), msg.Term)
-	assert.True(t, msg.VoteGranted)
+	assert.Equal(t, Term(1), res.Term)
+	assert.True(t, res.VoteGranted)
 }
 
 func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T) {
 	server := createNewServer()
 	server.currentTerm = 2
 
-	args := &v1.AppendEntriesRequest{
+	req := &AppendEntriesRequest{
 		Term:         1,
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
-		Entries: []*v1.LogEntry{
+		Entries: []*LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test"),
@@ -117,13 +115,11 @@ func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T)
 		},
 	}
 
-	req := connect.NewRequest(args)
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-	assert.Equal(t, uint64(2), msg.Term)
-	assert.False(t, msg.Success)
+	assert.Equal(t, Term(2), res.Term)
+	assert.False(t, res.Success)
 }
 
 func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(t *testing.T) {
@@ -136,21 +132,19 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 		},
 	}
 
-	args := &v1.AppendEntriesRequest{
+	req := &AppendEntriesRequest{
 		Term:         3,
 		LeaderId:     2,
 		PrevLogIndex: 2,
 		PrevLogTerm:  1,
-		Entries:      []*v1.LogEntry{},
+		Entries:      []*LogEntry{},
 	}
 
-	req := connect.NewRequest(args)
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-	require.Equal(t, uint64(3), msg.Term)
-	require.False(t, msg.Success)
+	require.Equal(t, Term(3), res.Term)
+	require.False(t, res.Success)
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidateState(t *testing.T) {
@@ -159,15 +153,14 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 	server.state = Candidate
 	server.currentTerm = 2
 
-	args := &v1.AppendEntriesRequest{
+	req := &AppendEntriesRequest{
 		Term:         3,
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  0,
-		Entries:      []*v1.LogEntry{},
+		Entries:      []*LogEntry{},
 	}
 
-	req := connect.NewRequest(args)
 	_, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
@@ -181,12 +174,12 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 	server.state = Leader
 	server.currentTerm = 2
 
-	req := connect.NewRequest(&v1.AppendEntriesRequest{
+	req := (&AppendEntriesRequest{
 		Term:         3,
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  0,
-		Entries:      []*v1.LogEntry{},
+		Entries:      []*LogEntry{},
 	})
 
 	_, err := server.AppendEntries(context.Background(), req)
@@ -201,12 +194,12 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 
 	server.currentTerm = 1
 
-	args := &v1.AppendEntriesRequest{
+	args := &AppendEntriesRequest{
 		Term:         1,
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries: []*v1.LogEntry{
+		Entries: []*LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test"),
@@ -215,14 +208,12 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 		LeaderCommit: 1,
 	}
 
-	req := connect.NewRequest(args)
+	req := (args)
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-
-	assert.Equal(t, uint64(1), msg.Term)
-	assert.True(t, msg.Success)
+	assert.Equal(t, Term(1), res.Term)
+	assert.True(t, res.Success)
 	assert.Equal(t, []LogEntry{
 		{
 			Term:    0,
@@ -247,12 +238,12 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 		Command: nil,
 	})
 
-	args := &v1.AppendEntriesRequest{
+	args := &AppendEntriesRequest{
 		Term:         1,
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
-		Entries: []*v1.LogEntry{
+		Entries: []*LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test2"),
@@ -261,14 +252,12 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 		LeaderCommit: 2,
 	}
 
-	req := connect.NewRequest(args)
+	req := (args)
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-
-	assert.Equal(t, uint64(1), msg.Term)
-	assert.True(t, msg.Success)
+	assert.Equal(t, Term(1), res.Term)
+	assert.True(t, res.Success)
 	assert.Equal(t, []LogEntry{
 		{
 			Term:    0,
@@ -289,24 +278,23 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 	server := createNewServer()
 
 	// Send a heartbeat to the Follower so it knows who the Leader is
-	req := connect.NewRequest(&v1.AppendEntriesRequest{
+	req := (&AppendEntriesRequest{
 		Term:         1,
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries:      []*v1.LogEntry{},
+		Entries:      []*LogEntry{},
 		LeaderCommit: 0,
 	})
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-	require.True(t, msg.Success)
+	require.True(t, res.Success)
 
 	result, err := server.ApplyCommand(context.Background(), []byte("test"))
 	assert.Nil(t, result)
 
-	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
+	expectedErr := &NotLeaderError{LeaderId: 2}
 
 	assert.Equal(t, expectedErr, err)
 }
@@ -317,25 +305,24 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 	// Send a heartbeat to the Follower so it knows who the Leader is
 
 	server.state = Candidate
-	req := connect.NewRequest(&v1.AppendEntriesRequest{
+	req := (&AppendEntriesRequest{
 		Term:         1,
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries:      []*v1.LogEntry{},
+		Entries:      []*LogEntry{},
 		LeaderCommit: 0,
 	})
 
 	res, err := server.AppendEntries(context.Background(), req)
 	require.NoError(t, err)
 
-	msg := res.Msg
-	require.True(t, msg.Success)
+	require.True(t, res.Success)
 
 	resp, err := server.ApplyCommand(context.Background(), []byte("test"))
 	assert.Nil(t, resp)
 
-	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
+	expectedErr := &NotLeaderError{LeaderId: 2}
 
 	assert.Equal(t, expectedErr, err)
 }

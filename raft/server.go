@@ -1,17 +1,28 @@
 // Package raft server implementation
 package raft
 
-n
+import (
+	"context"
+	"crypto/rand"
+	"log/slog"
+	"math/big"
+	"sync"
+	"time"
+)
+
+const (
+	heartbeatTimeout   = time.Millisecond * 50
+	minElectionTimeout = 150
+)
 
 type Server struct {
-	raftv1connect.UnimplementedRaftServiceHandler
-
 	mu              sync.Mutex
 	id              MemberId
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
 
 	clusterMembers map[MemberId]*ClusterMember
+	transport      Transport
 
 	// Persistent state on all servers
 	currentTerm Term
@@ -36,7 +47,7 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(minElectionTimeout+r.Int64())
 }
 
-func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, opts ...func(*Server) *Server) *Server {
+func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport Transport, opts ...func(*Server) *Server) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
 	}
@@ -47,14 +58,6 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, opts ...f
 
 	hbTicker := time.NewTicker(heartbeatTimeout)
 	hbTicker.Stop()
-
-	for _, member := range members {
-		member.rpcClient = raftv1connect.NewRaftServiceClient(
-			http.DefaultClient, // Todo - pass in a custom client
-			fmt.Sprintf("http://%s", member.Addr),
-			connect.WithGRPC(),
-		)
-	}
 
 	mm := map[MemberId]*ClusterMember{}
 
@@ -79,34 +82,33 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, opts ...f
 }
 
 // AppendEntries is an RPC method that is called by the Leader to replicate log entries
-func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.AppendEntriesRequest]) (*connect.Response[v1.AppendEntriesResponse], error) {
+func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (*AppendEntriesResult, error) {
 	// 1. Reply false if Term < currentTerm
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	req := connReq.Msg
 
 	s.updateTerm(ctx, Term(req.Term))
 
-	resp := &v1.AppendEntriesResponse{}
+	resp := &AppendEntriesResult{}
 
 	if s.state != Follower {
 		panic("Only followers should be receiving append entries")
 	}
 
-	leaderId := NewMemberId(req.LeaderId)
+	leaderId := req.LeaderId
 
 	if s.leader == nil || leaderId != s.leader.Id {
 		s.leader = s.getMemberById(leaderId)
 	}
 
-	resp.Term = uint64(s.currentTerm)
+	resp.Term = s.currentTerm
 	resp.Success = false
 
 	// Reply false if term < currentTerm
 	if Term(req.Term) < s.currentTerm {
 		// This is a stale request from an old Leader
 		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "Leader", req.LeaderId)
-		return connect.NewResponse(resp), nil
+		return resp, nil
 	}
 
 	// We have a valid Leader
@@ -121,7 +123,7 @@ func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.
 
 	if !validLog {
 		slog.Debug("Rejecting append entries request. Log was not valid", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", prevLogTerm, "logLength", logLen)
-		return connect.NewResponse(resp), nil
+		return (resp), nil
 	}
 
 	nextIdx := req.PrevLogIndex + 1
@@ -159,7 +161,7 @@ func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.
 
 	resp.Success = true
 
-	return connect.NewResponse(resp), nil
+	return (resp), nil
 }
 
 // Must be called with the lock held
@@ -181,8 +183,7 @@ func (s *Server) resetElectionTimer() {
 }
 
 // RequestVote is an RPC method that is called by candidates to gather votes
-func (s *Server) RequestVote(ctx context.Context, connReq *connect.Request[v1.RequestVoteRequest]) (*connect.Response[v1.RequestVoteResponse], error) {
-	req := connReq.Msg
+func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*RequestVoteResult, error) {
 	reqTerm := Term(req.Term)
 	candidateId := MemberId(req.CandidateId)
 	slog.Info("Received request for vote", "server", s.id, "term", reqTerm, "Candidate", candidateId)
@@ -190,14 +191,14 @@ func (s *Server) RequestVote(ctx context.Context, connReq *connect.Request[v1.Re
 	defer s.mu.Unlock()
 	s.updateTerm(ctx, reqTerm)
 
-	resp := &v1.RequestVoteResponse{}
+	resp := &RequestVoteResult{}
 
-	resp.Term = uint64(s.currentTerm)
+	resp.Term = s.currentTerm
 	resp.VoteGranted = false
 
 	if reqTerm < s.currentTerm {
 		slog.Debug("Rejecting vote request. Term not valid", "server", s.id, "term", reqTerm, "Candidate", candidateId, "currentTerm", s.currentTerm)
-		return connect.NewResponse(resp), nil
+		return (resp), nil
 	}
 
 	logLen := len(s.log) - 1
@@ -210,11 +211,11 @@ func (s *Server) RequestVote(ctx context.Context, connReq *connect.Request[v1.Re
 		s.votedFor = candidateId
 		resp.VoteGranted = true
 		s.resetElectionTimer()
-		return connect.NewResponse(resp), nil
+		return (resp), nil
 	} else {
 		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.votedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
 	}
-	return connect.NewResponse(resp), nil
+	return (resp), nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -262,7 +263,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 			slog.Debug("Sending heartbeat")
-			s.sendHeartbeat(nil)
+			s.sendHeartbeat(context.TODO())
 		}
 	}
 }
@@ -273,7 +274,7 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 
 	if s.state != Leader {
 		s.mu.Unlock()
-		return nil, &NotLeaderError{LeaderId: s.leader.Id, LeaderAddr: s.leader.Addr}
+		return nil, &NotLeaderError{LeaderId: s.leader.Id}
 	}
 
 	slog.Debug("Processing new commands", "commands", len(cmds))
@@ -310,33 +311,31 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				prevLogIndex := next - 1
 				prevLogTerm := s.log[prevLogIndex].Term
 
-				var entries []*v1.LogEntry
+				var entries []*LogEntry
 				logLen := uint64(len(s.log) - 1)
 				if logLen >= next {
 					for _, e := range s.log[next:] {
-						entries = append(entries, &v1.LogEntry{
-							Term:    uint64(e.Term),
+						entries = append(entries, &LogEntry{
+							Term:    e.Term,
 							Command: e.Command,
 						})
 					}
 				}
 
-				req := &v1.AppendEntriesRequest{
-					Term:         uint64(s.currentTerm),
-					LeaderId:     uint32(s.id),
+				req := &AppendEntriesRequest{
+					Term:         (s.currentTerm),
+					LeaderId:     (s.id),
 					LeaderCommit: s.commitIndex,
 					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  uint64(prevLogTerm),
+					PrevLogTerm:  (prevLogTerm),
 					Entries:      entries,
 				}
 				s.mu.Unlock()
 
-				connResp, err := member.rpcClient.AppendEntries(ctx, connect.NewRequest(req))
+				resp, err := s.transport.AppendEntries(ctx, member.Id, req)
 				if err != nil {
-					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", connResp.Msg.Success)
+					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", resp.Success)
 				}
-
-				resp := connResp.Msg
 
 				term := Term(resp.Term)
 				if s.checkResponseTerm(term) {
@@ -383,24 +382,22 @@ func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMembe
 		lastLogTerm = s.log[logLen-1].Term
 	}
 
-	req := &v1.RequestVoteRequest{
-		Term:         uint64(s.currentTerm),
-		CandidateId:  uint32(s.id),
+	req := &RequestVoteRequest{
+		Term:         (s.currentTerm),
+		CandidateId:  (s.id),
 		LastLogIndex: logLen,
-		LastLogTerm:  uint64(lastLogTerm),
+		LastLogTerm:  (lastLogTerm),
 	}
 
 	s.mu.Unlock()
 
-	connResp, err := member.rpcClient.RequestVote(ctx, connect.NewRequest(req))
+	resp, err := s.transport.RequestVote(ctx, member.Id, req)
 	if err != nil {
 		slog.Error("Error requesting vote", "member", member.Id, "error", err)
 		// This will be retried on the next election timer tick
 		return
 	}
 	s.mu.Lock()
-
-	resp := connResp.Msg
 
 	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
@@ -484,29 +481,29 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 			prevLogIndex := uint64(len(s.log) - 1)
 			prevLogTerm := s.log[prevLogIndex].Term
 
-			req := &v1.AppendEntriesRequest{
-				Term:         uint64(s.currentTerm),
-				LeaderId:     uint32(s.id),
+			req := &AppendEntriesRequest{
+				Term:         s.currentTerm,
+				LeaderId:     (s.id),
 				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  uint64(prevLogTerm),
-				Entries:      []*v1.LogEntry{},
+				PrevLogTerm:  (prevLogTerm),
+				Entries:      []*LogEntry{},
 			}
 			s.mu.Unlock()
 
-			resp, err := member.rpcClient.AppendEntries(ctx, connect.NewRequest(req))
+			resp, err := s.transport.AppendEntries(ctx, member.Id, req)
 			if err != nil {
 				slog.Error("Error sending heartbeat", "error", err)
 				return
 			}
 
-			_ = s.checkResponseTerm(Term(resp.Msg.Term))
+			_ = s.checkResponseTerm(Term(resp.Term))
 		}(ctx, member)
 	}
 }
 
 func (s *Server) checkResponseTerm(respTerm Term) bool {
 	if respTerm > s.currentTerm {
-		slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
+		slog.Info("Transitioning to Follower", "Term", s.currentTerm)
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.currentTerm = respTerm
