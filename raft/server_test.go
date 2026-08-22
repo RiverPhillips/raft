@@ -303,7 +303,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 	msg := res.Msg
 	require.True(t, msg.Success)
 
-	result, err := server.ApplyCommand([]byte("test"))
+	result, err := server.ApplyCommand(context.Background(), []byte("test"))
 	assert.Nil(t, result)
 
 	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}
@@ -332,7 +332,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 	msg := res.Msg
 	require.True(t, msg.Success)
 
-	resp, err := server.ApplyCommand([]byte("test"))
+	resp, err := server.ApplyCommand(context.Background(), []byte("test"))
 	assert.Nil(t, resp)
 
 	expectedErr := &NotLeaderError{LeaderId: 2, LeaderAddr: "two"}

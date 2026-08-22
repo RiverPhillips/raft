@@ -1,24 +1,7 @@
 // Package raft server implementation
 package raft
 
-import (
-	"connectrpc.com/connect"
-	"context"
-	"crypto/rand"
-	"fmt"
-	v1 "github.com/RiverPhillips/raft/gen/proto/raft/v1"
-	"github.com/RiverPhillips/raft/gen/proto/raft/v1/raftv1connect"
-	"log/slog"
-	"math/big"
-	"net/http"
-	"sync"
-	"time"
-)
-
-const (
-	heartbeatTimeout   = time.Millisecond * 50
-	minElectionTimeout = 150
-)
+n
 
 type Server struct {
 	raftv1connect.UnimplementedRaftServiceHandler
@@ -53,7 +36,7 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(minElectionTimeout+r.Int64())
 }
 
-func NewServer(id MemberId, sm StateMachine, members []*ClusterMember) *Server {
+func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, opts ...func(*Server) *Server) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
 	}
@@ -79,7 +62,7 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember) *Server {
 		mm[m.Id] = m
 	}
 
-	return &Server{
+	s := &Server{
 		state:           Follower,
 		id:              id,
 		electionTicker:  time.NewTicker(getElectionTimeout()),
@@ -88,6 +71,11 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember) *Server {
 		log:             []LogEntry{{}}, // Todo: Load from disk
 		stateMachine:    sm,
 	}
+
+	for _, opt := range opts {
+		s = opt(s)
+	}
+	return s
 }
 
 // AppendEntries is an RPC method that is called by the Leader to replicate log entries
@@ -97,15 +85,9 @@ func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.
 	defer s.mu.Unlock()
 	req := connReq.Msg
 
-	s.updateTerm(Term(req.Term))
+	s.updateTerm(ctx, Term(req.Term))
 
 	resp := &v1.AppendEntriesResponse{}
-
-	// If AppendEntries RPC received from new Leader: convert to Follower
-	if s.state == Candidate {
-		s.state = Follower
-		slog.Debug("Transitioning to Follower", "Term", s.currentTerm)
-	}
 
 	if s.state != Follower {
 		panic("Only followers should be receiving append entries")
@@ -181,7 +163,7 @@ func (s *Server) AppendEntries(ctx context.Context, connReq *connect.Request[v1.
 }
 
 // Must be called with the lock held
-func (s *Server) updateTerm(term Term) bool {
+func (s *Server) updateTerm(ctx context.Context, term Term) bool {
 	if term > s.currentTerm {
 		s.state = Follower
 		s.currentTerm = term
@@ -206,7 +188,7 @@ func (s *Server) RequestVote(ctx context.Context, connReq *connect.Request[v1.Re
 	slog.Info("Received request for vote", "server", s.id, "term", reqTerm, "Candidate", candidateId)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateTerm(reqTerm)
+	s.updateTerm(ctx, reqTerm)
 
 	resp := &v1.RequestVoteResponse{}
 
@@ -242,7 +224,6 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Start the election timer
 	// If the election timer elapses without receiving AppendEntries RPC from the current Leader or granting a vote to another Candidate, convert to Candidate
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -259,6 +240,8 @@ func (s *Server) Start(ctx context.Context) error {
 			s.currentTerm++
 			s.votedFor = s.id
 
+			var wg sync.WaitGroup
+			wg.Add(len(s.clusterMembers))
 			for _, member := range s.clusterMembers {
 				member.votedFor = 0
 				if member.Id == s.id {
@@ -268,12 +251,10 @@ func (s *Server) Start(ctx context.Context) error {
 					continue
 				}
 
-				go s.requestVoteFromMember(member)
+				go s.requestVoteFromMember(ctx, member)
 			}
-			s.checkIfElected()
+			s.checkIfElected(ctx)
 			s.mu.Unlock()
-			// Send RequestVote RPCs to all other servers
-			// If votes received from a quorum of servers: become Leader
 		case <-s.heartbeatTicker.C:
 			s.mu.Lock()
 			if s.state != Leader {
@@ -281,12 +262,12 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 			slog.Debug("Sending heartbeat")
-			s.sendHeartbeat()
+			s.sendHeartbeat(nil)
 		}
 	}
 }
 
-func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
+func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, error) {
 	slog.Debug("Received command", "commands", len(cmds))
 	s.mu.Lock()
 
@@ -303,6 +284,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 			Term:    s.currentTerm,
 			Command: cmd,
 		})
+
 		s.commitIndex++
 	}
 
@@ -321,6 +303,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 		go func(member *ClusterMember) {
 			// Todo: Add a limit to the number of entries that can be sent in a single RPC
 			// Todo: This retry loop should have an exponential backoff or something
+
 			for {
 				s.mu.Lock()
 				next := member.nextIndex
@@ -348,7 +331,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 				}
 				s.mu.Unlock()
 
-				connResp, err := member.rpcClient.AppendEntries(context.Background(), connect.NewRequest(req))
+				connResp, err := member.rpcClient.AppendEntries(ctx, connect.NewRequest(req))
 				if err != nil {
 					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", connResp.Msg.Success)
 				}
@@ -391,7 +374,7 @@ func (s *Server) ApplyCommand(cmds ...Command) ([]Result, error) {
 	return res, nil
 }
 
-func (s *Server) requestVoteFromMember(member *ClusterMember) {
+func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMember) {
 	s.mu.Lock()
 	slog.Debug("Requesting vote from server", "server", member.Id)
 	logLen := uint64(len(s.log) - 1)
@@ -409,7 +392,7 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 
 	s.mu.Unlock()
 
-	connResp, err := member.rpcClient.RequestVote(context.TODO(), connect.NewRequest(req))
+	connResp, err := member.rpcClient.RequestVote(ctx, connect.NewRequest(req))
 	if err != nil {
 		slog.Error("Error requesting vote", "member", member.Id, "error", err)
 		// This will be retried on the next election timer tick
@@ -422,7 +405,7 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
 
-	if s.updateTerm(Term(resp.Term)) {
+	if s.updateTerm(ctx, Term(resp.Term)) {
 		return
 	}
 
@@ -434,12 +417,12 @@ func (s *Server) requestVoteFromMember(member *ClusterMember) {
 	if resp.VoteGranted {
 		slog.Debug("Received vote from server", "server", member.Id)
 		member.votedFor = s.id
-		s.checkIfElected()
+		s.checkIfElected(ctx)
 	}
 }
 
 // Must be called with the lock held
-func (s *Server) checkIfElected() {
+func (s *Server) checkIfElected(ctx context.Context) {
 	if s.state == Candidate {
 		// If we're a Candidate we need to check if we've received a majority of votes
 		// If we have, we become the Leader
@@ -465,7 +448,7 @@ func (s *Server) checkIfElected() {
 				// Send initial empty AppendEntries RPCs to all other servers
 				// Include the Term in the RPC
 				// If followers are up-to-date, they will respond with success
-				s.sendHeartbeat()
+				s.sendHeartbeat(ctx)
 			} else {
 				slog.Debug("Not enough votes yet", "quorumSize", quorum, "votesReceived", votesReceived)
 			}
@@ -490,12 +473,12 @@ func (s *Server) initializeVolatileLeaderState() {
 
 }
 
-func (s *Server) sendHeartbeat() {
+func (s *Server) sendHeartbeat(ctx context.Context) {
 	for _, member := range s.clusterMembers {
 		if member.Id == s.id {
 			continue
 		}
-		go func(member *ClusterMember) {
+		go func(ctx context.Context, member *ClusterMember) {
 			s.mu.Lock()
 
 			prevLogIndex := uint64(len(s.log) - 1)
@@ -510,14 +493,14 @@ func (s *Server) sendHeartbeat() {
 			}
 			s.mu.Unlock()
 
-			resp, err := member.rpcClient.AppendEntries(context.TODO(), connect.NewRequest(req))
+			resp, err := member.rpcClient.AppendEntries(ctx, connect.NewRequest(req))
 			if err != nil {
 				slog.Error("Error sending heartbeat", "error", err)
 				return
 			}
 
 			_ = s.checkResponseTerm(Term(resp.Msg.Term))
-		}(member)
+		}(ctx, member)
 	}
 }
 
