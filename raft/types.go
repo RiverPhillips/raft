@@ -62,7 +62,7 @@ type AppendEntriesRequest struct {
 	// term of prevLogEntry
 	PrevLogTerm Term
 	//log entries to store (empty for heartbeat; may send more than one for efficiency)
-	Entries []*LogEntry
+	Entries []LogEntry
 	// leader's commit index
 	LeaderCommit uint64
 }

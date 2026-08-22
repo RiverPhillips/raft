@@ -1,6 +1,7 @@
 # AGENTS.md
 
-From-scratch Raft library in Go. Educational / work-in-progress: elections, log replication, and an in-memory KV state machine exist; durable storage and several safety details do not.
+From-scratch Raft library in Go. Educational / learning project: the goal is to learn Raft deeply.
+Code should be hand-written by the author — agents should provide design reviews, explanations, trade-off analysis, and debugging hints, NOT write or modify code unless explicitly directed.
 
 This is a library, not a process. There is no `main.go`, Docker, HTTP server, or observability. Prove behavior with tests.
 
@@ -12,14 +13,10 @@ Go: 1.27
 ```
 raft/                   # consensus core
   server.go             # Server, RPCs, election, replication, ApplyCommand
-  types.go              # Term, LogEntry, ServerState, ClusterMember, Command, StateMachine
+  types.go              # Term, LogEntry, ServerState, ClusterMember, Command, StateMachine, Transport
   state_machine.go      # NoOpStateMachine (tests)
   server_test.go        # unit tests (RequestVote, AppendEntries, ApplyCommand)
 kv/sm.go                # in-memory KV StateMachine + binary command encoding
-proto/raft/v1/raft.proto
-proto/buf.yaml
-buf.gen.yaml            # buf generate -> gen/
-gen/proto/raft/v1/      # generated protobuf + Connect handlers (committed)
 .github/workflows/ci.yml
 ```
 
@@ -27,7 +24,6 @@ Packages:
 
 - `raft` — consensus. Depend on this.
 - `kv` — optional `raft.StateMachine` used as a real SM in tests. Not a service.
-- `gen/proto/raft/v1` and `.../raftv1connect` — generated; do not edit by hand.
 
 Do not invent packages. Do not reintroduce `main`, Docker, OTEL, or a demo loop unless that is the task. There is no client library, no membership-change RPC, and no persistence layer.
 
@@ -36,13 +32,13 @@ Do not invent packages. Do not reintroduce `main`, Docker, OTEL, or a demo loop 
 Implemented:
 
 - Follower / Candidate / Leader
-- RequestVote and AppendEntries over Connect (gRPC protocol)
+- RequestVote and AppendEntries over injected `Transport` interface
 - Randomized election timeout, heartbeats
 - Log append + conflict truncate on followers
 - Leader `ApplyCommand(ctx, cmds...)` + parallel AppendEntries to peers
-- Follower redirect via `NotLeaderError` (LeaderId + Addr)
+- Follower redirect via `NotLeaderError` (LeaderId)
 - KV get/set encoding; apply happens on the leader after a quorum wait
-- `NewServer(id, sm, members, opts...)` functional options
+- `NewServer(id, sm, members, transport, opts...)` functional options
 
 Not implemented (do not pretend they work):
 
@@ -51,7 +47,6 @@ Not implemented (do not pretend they work):
 - Correct commit-index advancement from matchIndex (leader currently bumps `commitIndex` locally when appending)
 - Snapshotting, log compaction, membership changes
 - Bounded AppendEntries batches / backoff on retry
-- Injected transport: peers still use `http.DefaultClient` against `http://<member.Addr>`
 - Multi-node / in-process cluster tests
 
 ## Commands
@@ -64,22 +59,14 @@ go test -race -count=1 ./raft
 
 IDs must be >= 1. Cluster size must be odd (`NewServer` panics otherwise).
 
-Proto (only if you change `.proto`):
+## RPC / Transport
 
-```bash
-buf generate
-```
+RPCs are defined as Go struct types and handled via the `Transport` interface (`raft/types.go`):
 
-Commit the regenerated files under `gen/`. Config: `buf.gen.yaml` (`paths=source_relative`, package prefix `github.com/RiverPhillips/raft/gen`).
+- `AppendEntries(ctx context.Context, to MemberId, req *AppendEntriesRequest) (*AppendEntriesResult, error)`
+- `RequestVote(ctx context.Context, to MemberId, req *RequestVoteRequest) (*RequestVoteResult, error)`
 
-## RPC / wire
-
-Service `raft.v1.RaftService` in `proto/raft/v1/raft.proto`:
-
-- `AppendEntries`
-- `RequestVote`
-
-Handlers live on `raft.Server` (`raftv1connect.UnimplementedRaftServiceHandler`). Peer clients are created in `NewServer` as `http://<member.Addr>` with `connect.WithGRPC()`.
+`Server` handles incoming RPCs via direct method calls (`AppendEntries`, `RequestVote`) and sends outgoing RPCs via its injected `Transport`.
 
 KV command bytes (`kv/sm.go`): first byte `0` = get, `1` = set; then big-endian u32 key length + key; set also has u32 value length + value. `StateMachine.Apply(commands ...Command) []Result` must return one result per command.
 
@@ -123,7 +110,7 @@ Preferred next test (do this instead of plumbing): an in-process 3-node cluster 
 
 ## Style
 
-- Standard library + Connect + protobuf. New deps need a real reason. Do not add OTEL, HTTP servers, or process wrappers.
+- Standard library + testify + goleak. New deps need a real reason. Do not add OTEL, HTTP servers, or process wrappers.
 - Match neighboring files. `gofmt` everything you touch. `server.go` imports are not perfectly grouped; do not reformat the whole file in an unrelated change.
 - `log/slog` structured logs (`"server"`, `"term"`, `"Leader"`, `"Candidate"`). Keep that shape.
 - Consensus path often logs + returns RPC responses rather than bubbling errors.
@@ -131,8 +118,9 @@ Preferred next test (do this instead of plumbing): an in-process 3-node cluster 
 
 ## Working on this repo
 
-1. Read `raft/types.go` then the method you are changing in `raft/server.go`.
-2. Prefer a failing test first for protocol behavior.
-3. Run `go test -race ./...` before claiming done.
-4. Leave persistence / snapshots / membership as explicit follow-ups unless that is the task.
-5. Do not commit or push unless asked.
+1. River writes all code by hand. Agents act as pair reviewers and sounding boards.
+2. Discuss design, edge cases, failure modes, and test strategies; do not jump straight to generating implementations.
+3. Read `raft/types.go` then the method being discussed in `raft/server.go`.
+4. Prefer failing tests first for protocol behavior.
+5. Leave persistence / snapshots / membership as explicit follow-ups unless that is the focus.
+6. Do not commit or push unless asked.

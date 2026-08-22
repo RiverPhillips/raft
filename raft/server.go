@@ -56,6 +56,10 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 		panic("Cluster must have an odd number of members")
 	}
 
+	if transport == nil {
+		panic("Transport is required")
+	}
+
 	hbTicker := time.NewTicker(heartbeatTimeout)
 	hbTicker.Stop()
 
@@ -73,6 +77,7 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 		clusterMembers:  mm,
 		log:             []LogEntry{{}}, // Todo: Load from disk
 		stateMachine:    sm,
+		transport:       transport,
 	}
 
 	for _, opt := range opts {
@@ -87,7 +92,13 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.updateTerm(ctx, Term(req.Term))
+	if s.state == Candidate {
+		if req.Term >= s.currentTerm {
+			s.state = Follower
+		}
+	}
+
+	s.updateTerm(req.Term)
 
 	resp := &AppendEntriesResult{}
 
@@ -165,7 +176,7 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 }
 
 // Must be called with the lock held
-func (s *Server) updateTerm(ctx context.Context, term Term) bool {
+func (s *Server) updateTerm(term Term) bool {
 	if term > s.currentTerm {
 		s.state = Follower
 		s.currentTerm = term
@@ -189,7 +200,7 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 	slog.Info("Received request for vote", "server", s.id, "term", reqTerm, "Candidate", candidateId)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateTerm(ctx, reqTerm)
+	s.updateTerm(reqTerm)
 
 	resp := &RequestVoteResult{}
 
@@ -311,11 +322,11 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				prevLogIndex := next - 1
 				prevLogTerm := s.log[prevLogIndex].Term
 
-				var entries []*LogEntry
+				var entries []LogEntry
 				logLen := uint64(len(s.log) - 1)
 				if logLen >= next {
 					for _, e := range s.log[next:] {
-						entries = append(entries, &LogEntry{
+						entries = append(entries, LogEntry{
 							Term:    e.Term,
 							Command: e.Command,
 						})
@@ -402,7 +413,7 @@ func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMembe
 	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
 
-	if s.updateTerm(ctx, Term(resp.Term)) {
+	if s.updateTerm(resp.Term) {
 		return
 	}
 
@@ -486,7 +497,7 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 				LeaderId:     (s.id),
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  (prevLogTerm),
-				Entries:      []*LogEntry{},
+				Entries:      []LogEntry{},
 			}
 			s.mu.Unlock()
 
@@ -502,7 +513,10 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 }
 
 func (s *Server) checkResponseTerm(respTerm Term) bool {
-	if respTerm > s.currentTerm {
+	s.mu.Lock()
+	term := s.currentTerm
+	s.mu.Unlock()
+	if respTerm > term {
 		slog.Info("Transitioning to Follower", "Term", s.currentTerm)
 		s.mu.Lock()
 		defer s.mu.Unlock()

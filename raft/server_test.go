@@ -107,7 +107,7 @@ func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T)
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
-		Entries: []*LogEntry{
+		Entries: []LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test"),
@@ -137,7 +137,7 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 		LeaderId:     2,
 		PrevLogIndex: 2,
 		PrevLogTerm:  1,
-		Entries:      []*LogEntry{},
+		Entries:      []LogEntry{},
 	}
 
 	res, err := server.AppendEntries(context.Background(), req)
@@ -158,7 +158,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  0,
-		Entries:      []*LogEntry{},
+		Entries:      []LogEntry{},
 	}
 
 	_, err := server.AppendEntries(context.Background(), req)
@@ -179,7 +179,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  0,
-		Entries:      []*LogEntry{},
+		Entries:      []LogEntry{},
 	})
 
 	_, err := server.AppendEntries(context.Background(), req)
@@ -199,7 +199,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries: []*LogEntry{
+		Entries: []LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test"),
@@ -243,7 +243,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 		LeaderId:     2,
 		PrevLogIndex: 1,
 		PrevLogTerm:  1,
-		Entries: []*LogEntry{
+		Entries: []LogEntry{
 			{
 				Term:    1,
 				Command: []byte("test2"),
@@ -283,7 +283,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries:      []*LogEntry{},
+		Entries:      []LogEntry{},
 		LeaderCommit: 0,
 	})
 	res, err := server.AppendEntries(context.Background(), req)
@@ -310,7 +310,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 		LeaderId:     2,
 		PrevLogIndex: 0,
 		PrevLogTerm:  0,
-		Entries:      []*LogEntry{},
+		Entries:      []LogEntry{},
 		LeaderCommit: 0,
 	})
 
