@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -91,6 +92,12 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	// 1. Reply false if Term < currentTerm
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if req.Term < s.currentTerm {
+		return &AppendEntriesResult{
+			Term:    s.currentTerm,
+			Success: false,
+		}, nil
+	}
 
 	if s.state == Candidate {
 		if req.Term >= s.currentTerm {
@@ -165,7 +172,11 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	}
 
 	if req.LeaderCommit > s.commitIndex {
-		s.commitIndex = min(req.LeaderCommit, logLen)
+		prevCommitIdx := s.commitIndex
+		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
+		for i := prevCommitIdx + 1; i <= s.commitIndex; i++ {
+			s.stateMachine.Apply(s.log[i].Command)
+		}
 	}
 
 	// Todo: update state on disk
@@ -302,8 +313,14 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 
 	// Todo: persist to disk
 
-	var wg sync.WaitGroup
-	wg.Add(s.getQuorumSize())
+	quorumChan := make(chan struct{}, 1)
+	var confirmed atomic.Int32
+	confirmed.Store(1) // Leader already confirmed
+
+	quorumSize := s.getQuorumSize()
+	if quorumSize <= 1 {
+		quorumChan <- struct{}{}
+	}
 	s.mu.Unlock()
 
 	// Issue AppendEntries RPCs in parallel to each of the other servers to replicate the entry
@@ -317,6 +334,10 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 			// Todo: This retry loop should have an exponential backoff or something
 
 			for {
+				if ctx.Err() != nil {
+					return
+				}
+
 				s.mu.Lock()
 				next := member.nextIndex
 				prevLogIndex := next - 1
@@ -345,7 +366,13 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 
 				resp, err := s.transport.AppendEntries(ctx, member.Id, req)
 				if err != nil {
-					slog.Error("Error replicating entry", "server", member.Id, "error", err, "success", resp.Success)
+					slog.Error("Error replicating entry", "server", member.Id, "error", err)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(20 * time.Millisecond):
+						continue
+					}
 				}
 
 				term := Term(resp.Term)
@@ -366,15 +393,25 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 					member.nextIndex++
 					member.matchIndex = s.commitIndex
 					s.mu.Unlock()
+
 					// Entry was successfully replicated
+					if int(confirmed.Add(1)) == quorumSize {
+						select {
+						case quorumChan <- struct{}{}:
+						default:
+						}
+					}
 					break
 				}
 			}
-			wg.Done()
 		}(member)
 	}
 	// Wait for a quorum of servers to confirm the entry
-	wg.Wait()
+	select {
+	case <-quorumChan:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 
 	// Return the result of that execution to the client, this can't return an error as the command is already committed.
 	res := s.stateMachine.Apply(cmds...)
@@ -498,6 +535,7 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  (prevLogTerm),
 				Entries:      []LogEntry{},
+				LeaderCommit: s.commitIndex,
 			}
 			s.mu.Unlock()
 
