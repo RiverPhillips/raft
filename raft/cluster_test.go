@@ -95,7 +95,7 @@ func (c *InMemoryCluster) WaitLeader(t *testing.T) (MemberId, Term) {
 			s.mu.Lock()
 			state := s.state
 			id := s.id
-			term := s.currentTerm
+			term := s.CurrentTerm
 			s.mu.Unlock()
 
 			if state == Leader {
@@ -113,7 +113,7 @@ func (c *InMemoryCluster) WaitLeader(t *testing.T) (MemberId, Term) {
 		for _, s := range c.servers {
 			s.mu.Lock()
 			state := s.state
-			term := s.currentTerm
+			term := s.CurrentTerm
 			leader := s.leader
 			s.mu.Unlock()
 
@@ -139,8 +139,8 @@ func (c *InMemoryCluster) getLogs() map[MemberId][]LogEntry {
 	for id, s := range c.servers {
 		s.mu.Lock()
 		// Copy the log slice under the lock
-		logCopy := make([]LogEntry, len(s.log))
-		copy(logCopy, s.log)
+		logCopy := make([]LogEntry, len(s.Log))
+		copy(logCopy, s.Log)
 		logs[id] = logCopy
 		s.mu.Unlock()
 	}
@@ -303,7 +303,7 @@ func TestLeaderFailoverAndReplication(t *testing.T) {
 			}
 			s.mu.Lock()
 			state := s.state
-			term := s.currentTerm
+			term := s.CurrentTerm
 			s.mu.Unlock()
 
 			if state == Leader && term > term1 {
@@ -343,5 +343,51 @@ func TestLeaderFailoverAndReplication(t *testing.T) {
 	}, 2*time.Second, 50*time.Millisecond)
 
 	cancelAll()
+	assert.NoError(t, eg.Wait())
+}
+
+func TestLeaderDoesNotCommitWithoutQuorum(t *testing.T) {
+
+	eg, ctx := errgroup.WithContext(t.Context())
+	ctx, canc := context.WithCancel(ctx)
+	cluster := NewInMemoryCluster()
+
+	for _, s := range cluster.servers {
+		// todo: this will leak
+		eg.Go(func() error { return s.Start(ctx) })
+	}
+
+	leaderId, _ := cluster.WaitLeader(t)
+	leader := cluster.servers[leaderId]
+
+	// Read initial commit index
+	leader.mu.Lock()
+	initialCommit := leader.commitIndex
+	leader.mu.Unlock()
+
+	// Isolate the leader by stopping all other members
+	for id := range cluster.servers {
+		if id != leaderId {
+			cluster.Stop(id)
+		}
+	}
+
+	// Attempt to apply a command with a short timeout
+	timeoutCtx, timeoutCanc := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer timeoutCanc()
+
+	cmd := Command("uncommitted-command")
+	_, err := leader.ApplyCommand(timeoutCtx, cmd)
+	require.Error(t, err, "ApplyCommand should fail when quorum is unreachable")
+
+	// Verify leader did NOT advance commitIndex or apply to state machine
+	leader.mu.Lock()
+	assert.Equal(t, initialCommit, leader.commitIndex, "Leader commitIndex must not advance without quorum acknowledgment")
+	leader.mu.Unlock()
+
+	applied := (leader.stateMachine.(*RecordingStateMachine)).Applied() // using RecordingStateMachine
+	assert.NotContains(t, applied, cmd, "Uncommitted command must not be applied to StateMachine")
+
+	canc()
 	assert.NoError(t, eg.Wait())
 }

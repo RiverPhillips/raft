@@ -45,6 +45,10 @@ func (e *NotLeaderError) Error() string {
 
 type Command []byte
 
+// MaxCommandSize is the maximum allowed serialized command payload (1 MiB).
+// Keeps WAL frame bounded and prevents OOM on a forged CmdLen.
+const MaxCommandSize = 1 << 20
+
 type Result []byte
 
 type StateMachine interface {
@@ -95,7 +99,20 @@ type RequestVoteResult struct {
 	VoteGranted bool
 }
 
+type PersistentState struct {
+	// Persistent state on all servers
+	CurrentTerm Term
+	VotedFor    MemberId
+	Log         []LogEntry
+}
+
 type Transport interface {
 	RequestVote(ctx context.Context, to MemberId, req *RequestVoteRequest) (*RequestVoteResult, error)
 	AppendEntries(ctx context.Context, to MemberId, req *AppendEntriesRequest) (*AppendEntriesResult, error)
+}
+
+type Storage interface {
+	WriteMetadata(ctx context.Context, currentTerm Term, votedFor MemberId) error
+	AppendToLog(ctx context.Context, logs ...LogEntry) error
+	LoadState(ctx context.Context) (PersistentState, error)
 }

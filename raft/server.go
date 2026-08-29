@@ -4,8 +4,10 @@ package raft
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"log/slog"
 	"math/big"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,11 @@ const (
 	minElectionTimeout = 150
 )
 
+type volatileState struct {
+	commitIndex uint64
+	lastApplied uint64
+}
+
 type Server struct {
 	mu              sync.Mutex
 	id              MemberId
@@ -25,15 +32,10 @@ type Server struct {
 	clusterMembers map[MemberId]*ClusterMember
 	transport      Transport
 
-	// Persistent state on all servers
-	currentTerm Term
-	votedFor    MemberId
-	log         []LogEntry // This is indexed from 1
+	PersistentState
+	volatileState
 
-	// Volatile state on all servers
-	commitIndex uint64
-	lastApplied uint64
-	state       ServerState
+	state ServerState
 
 	leader *ClusterMember
 
@@ -76,9 +78,11 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 		electionTicker:  time.NewTicker(getElectionTimeout()),
 		heartbeatTicker: hbTicker,
 		clusterMembers:  mm,
-		log:             []LogEntry{{}}, // Todo: Load from disk
-		stateMachine:    sm,
-		transport:       transport,
+		PersistentState: PersistentState{
+			Log: []LogEntry{{Term: 0, Command: nil}}, // Todo: Load from disk
+		},
+		stateMachine: sm,
+		transport:    transport,
 	}
 
 	for _, opt := range opts {
@@ -92,15 +96,15 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	// 1. Reply false if Term < currentTerm
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if req.Term < s.currentTerm {
+	if req.Term < s.CurrentTerm {
 		return &AppendEntriesResult{
-			Term:    s.currentTerm,
+			Term:    s.CurrentTerm,
 			Success: false,
 		}, nil
 	}
 
 	if s.state == Candidate {
-		if req.Term >= s.currentTerm {
+		if req.Term >= s.CurrentTerm {
 			s.state = Follower
 		}
 	}
@@ -119,13 +123,13 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 		s.leader = s.getMemberById(leaderId)
 	}
 
-	resp.Term = s.currentTerm
+	resp.Term = s.CurrentTerm
 	resp.Success = false
 
 	// Reply false if term < currentTerm
-	if Term(req.Term) < s.currentTerm {
+	if Term(req.Term) < s.CurrentTerm {
 		// This is a stale request from an old Leader
-		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.currentTerm, "Leader", req.LeaderId)
+		slog.Debug("Rejecting append entries request from stale Leader", "server", s.id, "term", req.Term, "currentTerm", s.CurrentTerm, "Leader", req.LeaderId)
 		return resp, nil
 	}
 
@@ -136,8 +140,8 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	slog.Debug("Received append entries request from valid Leader", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", prevLogTerm, "entries", len(req.Entries))
 
 	// 2. Reply false if log does not contain an entry at prevLogIndex whose Term matches prevLogTerm
-	logLen := uint64(len(s.log))
-	validLog := req.PrevLogIndex == 0 || (req.PrevLogIndex < logLen && s.log[req.PrevLogIndex].Term == prevLogTerm)
+	logLen := uint64(len(s.Log))
+	validLog := req.PrevLogIndex < logLen && s.Log[req.PrevLogIndex].Term == prevLogTerm
 
 	if !validLog {
 		slog.Debug("Rejecting append entries request. Log was not valid", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "prevLogIndex", req.PrevLogIndex, "prevLogTerm", prevLogTerm, "logLength", logLen)
@@ -152,30 +156,30 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 			Term:    Term(ent.Term),
 			Command: ent.Command,
 		}
-		if i >= uint64(cap(s.log)) {
+		if i >= uint64(cap(s.Log)) {
 			// We're at the capacity of the log let's increase the capacity
 			newLen := nextIdx + uint64(len(req.Entries))
 			newLog := make([]LogEntry, i, newLen*2)
-			copy(newLog, s.log)
-			s.log = newLog
-		} else if logLen > i && s.log[i].Term != entry.Term {
-			s.log = s.log[:i]
-			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.log))
+			copy(newLog, s.Log)
+			s.Log = newLog
+		} else if logLen > i && s.Log[i].Term != entry.Term {
+			s.Log = s.Log[:i]
+			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.Log))
 		}
 
-		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.log))
-		if i < uint64(len(s.log)) {
+		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.Log))
+		if i < uint64(len(s.Log)) {
 			slog.Debug("Log is unchanged")
 		} else {
-			s.log = append(s.log, entry)
+			s.Log = append(s.Log, entry)
 		}
 	}
 
 	if req.LeaderCommit > s.commitIndex {
 		prevCommitIdx := s.commitIndex
-		s.commitIndex = min(req.LeaderCommit, uint64(len(s.log)-1))
+		s.commitIndex = min(req.LeaderCommit, uint64(len(s.Log)-1))
 		for i := prevCommitIdx + 1; i <= s.commitIndex; i++ {
-			s.stateMachine.Apply(s.log[i].Command)
+			s.stateMachine.Apply(s.Log[i].Command)
 		}
 	}
 
@@ -188,10 +192,10 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 
 // Must be called with the lock held
 func (s *Server) updateTerm(term Term) bool {
-	if term > s.currentTerm {
+	if term > s.CurrentTerm {
 		s.state = Follower
-		s.currentTerm = term
-		s.votedFor = 0
+		s.CurrentTerm = term
+		s.VotedFor = 0
 		// Todo: update state on disk
 		s.resetElectionTimer()
 		return true
@@ -215,27 +219,29 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 
 	resp := &RequestVoteResult{}
 
-	resp.Term = s.currentTerm
+	resp.Term = s.CurrentTerm
 	resp.VoteGranted = false
 
-	if reqTerm < s.currentTerm {
-		slog.Debug("Rejecting vote request. Term not valid", "server", s.id, "term", reqTerm, "Candidate", candidateId, "currentTerm", s.currentTerm)
+	if reqTerm < s.CurrentTerm {
+		slog.Debug("Rejecting vote request. Term not valid", "server", s.id, "term", reqTerm, "Candidate", candidateId, "currentTerm", s.CurrentTerm)
 		return (resp), nil
 	}
 
-	logLen := len(s.log) - 1
-	lastLogTerm := Term(req.LastLogTerm)
-	logValid := lastLogTerm > s.log[logLen].Term || req.LastLogIndex >= uint64(logLen)
-	grantVote := reqTerm >= s.currentTerm && (s.votedFor == 0 || s.votedFor == candidateId) && logValid
+	logLen := uint64(len(s.Log) - 1)
+	myLastTerm := s.Log[logLen].Term
+	reqLastTerm := Term(req.LastLogTerm)
+
+	logValid := reqLastTerm > myLastTerm || (reqLastTerm == myLastTerm && req.LastLogIndex >= logLen)
+	grantVote := reqTerm >= s.CurrentTerm && (s.VotedFor == 0 || s.VotedFor == candidateId) && logValid
 
 	if grantVote {
 		slog.Debug("Voting for server", "server", candidateId)
-		s.votedFor = candidateId
+		s.VotedFor = candidateId
 		resp.VoteGranted = true
 		s.resetElectionTimer()
 		return (resp), nil
 	} else {
-		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.votedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
+		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.VotedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
 	}
 	return (resp), nil
 }
@@ -260,8 +266,8 @@ func (s *Server) Start(ctx context.Context) error {
 				panic("Illegal state transition from Leader to Candidate")
 			}
 			s.state = Candidate
-			s.currentTerm++
-			s.votedFor = s.id
+			s.CurrentTerm++
+			s.VotedFor = s.id
 
 			var wg sync.WaitGroup
 			wg.Add(len(s.clusterMembers))
@@ -299,16 +305,26 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 		return nil, &NotLeaderError{LeaderId: s.leader.Id}
 	}
 
+	// Reject empty or oversized commands — sentinel {0,nil} is the only allowed empty entry
+	for _, cmd := range cmds {
+		if len(cmd) == 0 {
+			s.mu.Unlock()
+			return nil, errors.New("empty command not allowed")
+		}
+		if len(cmd) > MaxCommandSize {
+			s.mu.Unlock()
+			return nil, errors.New("command too large")
+		}
+	}
+
 	slog.Debug("Processing new commands", "commands", len(cmds))
 
 	// Append the command(s) to the log
 	for _, cmd := range cmds {
-		s.log = append(s.log, LogEntry{
-			Term:    s.currentTerm,
+		s.Log = append(s.Log, LogEntry{
+			Term:    s.CurrentTerm,
 			Command: cmd,
 		})
-
-		s.commitIndex++
 	}
 
 	// Todo: persist to disk
@@ -341,12 +357,12 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				s.mu.Lock()
 				next := member.nextIndex
 				prevLogIndex := next - 1
-				prevLogTerm := s.log[prevLogIndex].Term
+				prevLogTerm := s.Log[prevLogIndex].Term
 
 				var entries []LogEntry
-				logLen := uint64(len(s.log) - 1)
+				logLen := uint64(len(s.Log) - 1)
 				if logLen >= next {
-					for _, e := range s.log[next:] {
+					for _, e := range s.Log[next:] {
 						entries = append(entries, LogEntry{
 							Term:    e.Term,
 							Command: e.Command,
@@ -355,7 +371,7 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				}
 
 				req := &AppendEntriesRequest{
-					Term:         (s.currentTerm),
+					Term:         (s.CurrentTerm),
 					LeaderId:     (s.id),
 					LeaderCommit: s.commitIndex,
 					PrevLogIndex: prevLogIndex,
@@ -381,7 +397,7 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				}
 
 				if !resp.Success {
-					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.currentTerm)
+					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.CurrentTerm)
 					if member.nextIndex == 0 {
 						slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
 						panic("Follower is missing entries and Leader has no more entries to send")
@@ -409,6 +425,7 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 	// Wait for a quorum of servers to confirm the entry
 	select {
 	case <-quorumChan:
+		s.maybeAdvanceCommitIndex()
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -424,16 +441,13 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMember) {
 	s.mu.Lock()
 	slog.Debug("Requesting vote from server", "server", member.Id)
-	logLen := uint64(len(s.log) - 1)
-	lastLogTerm := Term(0)
-	if logLen > 0 {
-		lastLogTerm = s.log[logLen-1].Term
-	}
+	lastLogIndex := uint64(len(s.Log) - 1)
+	lastLogTerm := s.Log[lastLogIndex].Term
 
 	req := &RequestVoteRequest{
-		Term:         (s.currentTerm),
+		Term:         (s.CurrentTerm),
 		CandidateId:  (s.id),
-		LastLogIndex: logLen,
+		LastLogIndex: lastLogIndex,
 		LastLogTerm:  (lastLogTerm),
 	}
 
@@ -510,7 +524,7 @@ func (s *Server) getQuorumSize() int {
 func (s *Server) initializeVolatileLeaderState() {
 	for _, m := range s.clusterMembers {
 		// NextIndex for each server is initialized to the Leader's last log index + 1
-		m.nextIndex = uint64(len(s.log))
+		m.nextIndex = uint64(len(s.Log))
 		// MatchIndex for each server is initialized to 0
 		// This is the highest index in the Leader's log that the Follower has confirmed is replicated
 		m.matchIndex = 0
@@ -526,16 +540,16 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 		go func(ctx context.Context, member *ClusterMember) {
 			s.mu.Lock()
 
-			prevLogIndex := uint64(len(s.log) - 1)
-			prevLogTerm := s.log[prevLogIndex].Term
+			prevLogIndex := uint64(len(s.Log) - 1)
+			prevLogTerm := s.Log[prevLogIndex].Term
 
 			req := &AppendEntriesRequest{
-				Term:         s.currentTerm,
+				Term:         s.CurrentTerm,
 				LeaderId:     (s.id),
+				LeaderCommit: s.commitIndex,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  (prevLogTerm),
 				Entries:      []LogEntry{},
-				LeaderCommit: s.commitIndex,
 			}
 			s.mu.Unlock()
 
@@ -552,15 +566,15 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 
 func (s *Server) checkResponseTerm(respTerm Term) bool {
 	s.mu.Lock()
-	term := s.currentTerm
+	term := s.CurrentTerm
 	s.mu.Unlock()
 	if respTerm > term {
-		slog.Info("Transitioning to Follower", "Term", s.currentTerm)
+		slog.Info("Transitioning to Follower", "Term", s.CurrentTerm)
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.currentTerm = respTerm
+		s.CurrentTerm = respTerm
 		s.state = Follower
-		s.votedFor = 0
+		s.VotedFor = 0
 		s.resetElectionTimer()
 		return true
 	}
@@ -578,4 +592,23 @@ func (s *Server) State() ServerState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.state
+}
+
+func (s *Server) maybeAdvanceCommitIndex() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	matchIndexes := make([]uint64, 0, len(s.clusterMembers))
+	for k, v := range s.clusterMembers {
+		if k == s.id {
+			matchIndexes = append(matchIndexes, uint64(len(s.Log)-1))
+		} else {
+			matchIndexes = append(matchIndexes, v.matchIndex)
+		}
+	}
+	slices.Sort(matchIndexes)
+	majorityIndex := matchIndexes[len(matchIndexes)/2]
+	if majorityIndex > s.commitIndex && s.Log[majorityIndex].Term == s.CurrentTerm {
+		s.commitIndex = majorityIndex
+	}
+	return s.commitIndex
 }
