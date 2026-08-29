@@ -108,3 +108,47 @@ func TestLoadsLogs(t *testing.T) {
 	assert.Equal(t, state.Log, []raft.LogEntry{{Term: raft.Term(10), Command: raft.Command("test")}})
 
 }
+
+func TestTruncateLog(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := NewOnDiskStorage(dir)
+	require.NoError(t, err)
+
+	require.NoError(t, storage.WriteMetadata(t.Context(), 1, 1))
+	err = storage.AppendToLog(t.Context(),
+		raft.LogEntry{Term: raft.Term(1), Command: raft.Command("test1")},
+		raft.LogEntry{Term: raft.Term(2), Command: raft.Command("test2")},
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, storage.Close(t.Context()))
+
+	storage, err = NewOnDiskStorage(dir)
+	require.NoError(t, err)
+
+	state, err := storage.LoadState(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, []raft.LogEntry{
+		{Term: raft.Term(1), Command: raft.Command("test1")},
+		{Term: raft.Term(2), Command: raft.Command("test2")},
+	}, state.Log)
+
+	err = storage.TruncateLog(t.Context(), uint64(2))
+	require.NoError(t, err)
+
+	require.NoError(t, storage.AppendToLog(t.Context(), raft.LogEntry{Term: 1, Command: raft.Command("test3")}))
+
+	require.NoError(t, storage.Close(t.Context()))
+
+	storage, err = NewOnDiskStorage(dir)
+	require.NoError(t, err)
+
+	state, err = storage.LoadState(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, []raft.LogEntry{
+		{Term: raft.Term(1), Command: raft.Command("test1")},
+		{Term: raft.Term(1), Command: raft.Command("test3")},
+	}, state.Log)
+}

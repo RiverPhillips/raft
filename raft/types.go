@@ -115,4 +115,5 @@ type Storage interface {
 	WriteMetadata(ctx context.Context, currentTerm Term, votedFor MemberId) error
 	AppendToLog(ctx context.Context, logs ...LogEntry) error
 	LoadState(ctx context.Context) (PersistentState, error)
+	TruncateLog(ctx context.Context, idx uint64) error
 }

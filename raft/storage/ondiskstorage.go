@@ -64,7 +64,7 @@ func NewOnDiskStorage(dirPath string) (*OnDiskStorage, error) {
 		return nil, fmt.Errorf("failed to acquire lock: %w", err)
 	}
 
-	walFile, err := os.OpenFile(dirPath+"/raft.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
+	walFile, err := os.OpenFile(dirPath+"/raft.log", os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, err
 	}
@@ -347,4 +347,56 @@ func (s *OnDiskStorage) Close(ctx context.Context) error {
 	s.lockFile = nil
 
 	return err
+}
+
+// Truncates log removing all entries from index, 1 based indexing
+// i.e. Truncate(ctx, 2) removes all entries from position 2 onwards
+func (s *OnDiskStorage) TruncateLog(ctx context.Context, idx uint64) error {
+	// Find the start of idx
+	// We're starting at position i
+	var curr uint64 = 1
+	// Reuse this buffer
+	cmdLenBuf := make([]byte, 4)
+
+	// Move back to the start
+	if _, err := s.walFile.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	for curr < idx {
+		// Skip the first 8 bytes - we don't care about the term
+		if _, err := s.walFile.Seek(8, io.SeekCurrent); err != nil {
+			return err
+		}
+
+		if _, err := io.ReadFull(s.walFile, cmdLenBuf); err != nil {
+			return err
+		}
+		cmdLen := binary.BigEndian.Uint32(cmdLenBuf)
+
+		// Advance past the cmd
+		if _, err := s.walFile.Seek(int64(cmdLen), io.SeekCurrent); err != nil {
+			return err
+		}
+
+		// Skip the checksum
+		if _, err := s.walFile.Seek(4, io.SeekCurrent); err != nil {
+			return err
+		}
+		curr += 1
+	}
+
+	currentOffset, err := s.walFile.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	if err := s.walFile.Truncate(currentOffset); err != nil {
+		return err
+	}
+
+	if err := s.walFile.Sync(); err != nil {
+		return err
+	}
+	return nil
 }

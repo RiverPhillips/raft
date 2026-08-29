@@ -42,16 +42,18 @@ Implemented:
 - Randomized election timeout (150–299ms), heartbeats (50ms)
 - Log append + conflict truncate on followers
 - Channel-based quorum wait in leader `ApplyCommand(ctx, cmds...)` + parallel AppendEntries to peers
+- Leader `commitIndex` calculation from majority `matchIndex` and current-term validation (Raft §5.3 / §5.4 / Figure 8)
 - Follower redirect via `NotLeaderError` (LeaderId)
-- Follower commit index advancement and apply loop to `StateMachine`
-- In-process 3-node cluster tests in `cluster_test.go` (election, replication, leader failover)
+- Follower commit index advancement (`min(LeaderCommit, len(Log)-1)`) and apply loop to `StateMachine`
+- In-process 3-node cluster tests in `cluster_test.go` (election, replication, leader failover, uncommitted quorum isolation)
 - KV get/set encoding
 - `NewServer(id, sm, members, transport, opts...)` functional options
+- `OnDiskStorage` with CRC-checked binary WAL and atomic metadata persistence (`raft/storage`)
 
 Not implemented (do not pretend they work):
 
-- Persistent `currentTerm` / `votedFor` / log (`raft/storage` in progress)
-- Correct leader commit-index advancement purely from follower `matchIndex` (leader currently bumps `commitIndex` locally upon appending)
+- Storage wired into `Server` consensus path (`Server` does not yet persist on state transitions or read on boot)
+- WAL truncation on log conflicts (`Storage` needs log truncation / overwrite capability)
 - Snapshotting, log compaction, dynamic membership changes
 - Bounded AppendEntries batches / backoff on retry
 
@@ -130,9 +132,9 @@ Conventions:
 When changing election, replication, or apply: run `go test -race ./raft` or `just test-repeat 20`. CI always uses `-race`.
 
 Preferred next milestones:
-1. Leader `commitIndex` calculation from majority `matchIndex` (Raft §5.3 / §5.4).
-2. Node restart / rejoin after crash (bringing stopped nodes back online to catch up).
-3. Durable persistence (`Storage` interface for `currentTerm`, `votedFor`, and WAL).
+1. Log truncation / overwrite support in `Storage` interface & `OnDiskStorage`.
+2. Wire `Storage` into `Server` (`LoadState` on boot, `WriteMetadata`, `AppendToLog` / truncate on RPC transitions).
+3. Node restart & rejoin cluster integration tests (crash recovery).
 
 ## Style
 
