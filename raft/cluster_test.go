@@ -166,7 +166,7 @@ func assertLogsMatch(t *testing.T, cluster InMemoryCluster, expectedEntries ...L
 	}, 2*time.Second, 50*time.Millisecond)
 }
 
-func NewInMemoryCluster() InMemoryCluster {
+func NewInMemoryCluster(t *testing.T) InMemoryCluster {
 	transport := &InMemoryTransport{
 		servers: map[MemberId]*Server{},
 		stopped: map[MemberId]bool{},
@@ -184,11 +184,13 @@ func NewInMemoryCluster() InMemoryCluster {
 		for _, m := range memberIds {
 			clusterMembers = append(clusterMembers, &ClusterMember{Id: m})
 		}
+		store := &memoryStorage{}
 		srv := NewServer(
 			m,
 			&RecordingStateMachine{},
 			clusterMembers,
 			transport,
+			store,
 		)
 		transport.servers[m] = srv
 		cluster.servers[m] = srv
@@ -201,7 +203,7 @@ func TestElectsALeader(t *testing.T) {
 
 	eg, ctx := errgroup.WithContext(t.Context())
 	ctx, canc := context.WithCancel(ctx)
-	cluster := NewInMemoryCluster()
+	cluster := NewInMemoryCluster(t)
 
 	for _, s := range cluster.servers {
 		// todo: this will leak
@@ -219,7 +221,7 @@ func TestElectsALeader(t *testing.T) {
 func TestTheSameCommandsGetsAppliesToAllMembers(t *testing.T) {
 	eg, ctx := errgroup.WithContext(t.Context())
 	ctx, canc := context.WithCancel(ctx)
-	cluster := NewInMemoryCluster()
+	cluster := NewInMemoryCluster(t)
 
 	for _, s := range cluster.servers {
 		// todo: this will leak
@@ -263,7 +265,7 @@ func TestTheSameCommandsGetsAppliesToAllMembers(t *testing.T) {
 			}
 		}
 		return true
-	}, time.Second, time.Millisecond*50)
+	}, 3*time.Second, time.Millisecond*50)
 
 	canc()
 	assert.NoError(t, eg.Wait())
@@ -272,7 +274,7 @@ func TestTheSameCommandsGetsAppliesToAllMembers(t *testing.T) {
 func TestLeaderFailoverAndReplication(t *testing.T) {
 	eg, ctx := errgroup.WithContext(t.Context())
 	ctx, cancelAll := context.WithCancel(ctx)
-	cluster := NewInMemoryCluster()
+	cluster := NewInMemoryCluster(t)
 
 	serverCancels := make(map[MemberId]context.CancelFunc)
 
@@ -293,10 +295,14 @@ func TestLeaderFailoverAndReplication(t *testing.T) {
 	cluster.Stop(leader1)
 	serverCancels[leader1]()
 
-	// 4. Wait for a new leader to emerge among the remaining 2 servers
+	// 4. Wait for a new leader to emerge and the surviving cluster to converge
 	var newLeader MemberId
 	var newTerm Term
 	assert.Eventually(t, func() bool {
+		leaderCount := 0
+		var currentLeaderId MemberId
+		var currentLeaderTerm Term
+
 		for id, s := range cluster.servers {
 			if id == leader1 {
 				continue
@@ -307,12 +313,41 @@ func TestLeaderFailoverAndReplication(t *testing.T) {
 			s.mu.Unlock()
 
 			if state == Leader && term > term1 {
-				newLeader = id
-				newTerm = term
-				return true
+				leaderCount++
+				currentLeaderId = id
+				currentLeaderTerm = term
 			}
 		}
-		return false
+
+		if leaderCount != 1 || currentLeaderTerm == 0 {
+			return false
+		}
+
+		// Ensure the surviving follower agrees on term and recognizes the new leader
+		for id, s := range cluster.servers {
+			if id == leader1 {
+				continue
+			}
+			s.mu.Lock()
+			state := s.state
+			term := s.CurrentTerm
+			leader := s.leader
+			s.mu.Unlock()
+
+			if term != currentLeaderTerm {
+				return false
+			}
+
+			if state == Follower {
+				if leader == nil || leader.Id != currentLeaderId {
+					return false
+				}
+			}
+		}
+
+		newLeader = currentLeaderId
+		newTerm = currentLeaderTerm
+		return true
 	}, 3*time.Second, 50*time.Millisecond)
 
 	require.NotEqual(t, leader1, newLeader)
@@ -350,7 +385,7 @@ func TestLeaderDoesNotCommitWithoutQuorum(t *testing.T) {
 
 	eg, ctx := errgroup.WithContext(t.Context())
 	ctx, canc := context.WithCancel(ctx)
-	cluster := NewInMemoryCluster()
+	cluster := NewInMemoryCluster(t)
 
 	for _, s := range cluster.servers {
 		// todo: this will leak

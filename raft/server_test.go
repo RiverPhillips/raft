@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -18,8 +19,10 @@ func (noopTransport) AppendEntries(context.Context, MemberId, *AppendEntriesRequ
 	return nil, nil
 }
 
-func createNewServer() *Server {
+func createNewServer(t *testing.T) *Server {
+	t.Helper()
 	sm := &NoOpStateMachine{}
+	store := &memoryStorage{}
 	return NewServer(NewMemberId(1), sm, []*ClusterMember{
 		{
 			Id: NewMemberId(1),
@@ -30,7 +33,81 @@ func createNewServer() *Server {
 		{
 			Id: NewMemberId(3),
 		},
-	}, noopTransport{})
+	}, noopTransport{}, store)
+}
+
+// memoryStorage is an in-process Storage mock for protocol unit tests.
+// It mirrors the disk layout of OnDiskStorage (Log has no sentinel; index 1 is
+// the first real entry, and AppendingLog appends from the end), but is
+// unconstrained by files, checksums or empty-command rules so tests can
+// exercise pure Raft protocol logic (election, replication, conflict truncate)
+// against a controllable in-memory state.
+type memoryStorage struct {
+	mu        sync.Mutex
+	term      Term
+	votedFor  MemberId
+	log       []LogEntry
+	fatalErr  error // if set, every call returns this error (simulates disk failure)
+}
+
+func (m *memoryStorage) fail() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.fatalErr
+}
+
+func (m *memoryStorage) setFatalErr(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fatalErr = err
+}
+
+func (m *memoryStorage) WriteMetadata(ctx context.Context, currentTerm Term, votedFor MemberId) error {
+	if err := m.fail(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.term = currentTerm
+	m.votedFor = votedFor
+	return nil
+}
+
+func (m *memoryStorage) AppendToLog(ctx context.Context, logs ...LogEntry) error {
+	if err := m.fail(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.log = append(m.log, logs...)
+	return nil
+}
+
+func (m *memoryStorage) LoadState(ctx context.Context) (PersistentState, error) {
+	if err := m.fail(); err != nil {
+		return PersistentState{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	log := make([]LogEntry, len(m.log))
+	copy(log, m.log)
+	return PersistentState{CurrentTerm: m.term, VotedFor: m.votedFor, Log: log}, nil
+}
+
+// TruncateLog removes all entries from the 1-based index onwards.
+func (m *memoryStorage) TruncateLog(ctx context.Context, idx uint64) error {
+	if err := m.fail(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// 1-based; keep entries [0, idx-1)
+	keep := idx - 1
+	if keep >= uint64(len(m.log)) {
+		keep = uint64(len(m.log))
+	}
+	m.log = m.log[:keep]
+	return nil
 }
 
 func TestMain(m *testing.M) {
@@ -38,7 +115,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.CurrentTerm = 2
 
@@ -57,7 +134,7 @@ func TestServer_RequestVote_RejectsWhenTermIsBehindServer(t *testing.T) {
 }
 
 func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.CurrentTerm = 1
 	server.Log = append(server.Log, LogEntry{
@@ -80,7 +157,7 @@ func TestServer_RequestVote_ReturnsFalseWhenLogIsNotUpToDate(t *testing.T) {
 }
 
 func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.CurrentTerm = 0
 
@@ -99,7 +176,7 @@ func TestServer_RequestVote_ReturnsTrueWhenTermIsValidAndLogIsUpToDate(t *testin
 }
 
 func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.CurrentTerm = 2
 
 	req := &AppendEntriesRequest{
@@ -123,7 +200,7 @@ func TestServer_AppendEntries_ReturnFalseIfTermLessThanCurrentTerm(t *testing.T)
 }
 
 func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.CurrentTerm = 2
 	server.Log = []LogEntry{
 		{
@@ -148,7 +225,7 @@ func TestServer_AppendEntries_ReturnFalseIfLogDoesNotContainEntryAtPrevLogIndex(
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidateState(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.state = Candidate
 	server.CurrentTerm = 2
@@ -169,7 +246,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInCandidat
 }
 
 func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderState(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.state = Leader
 	server.CurrentTerm = 2
@@ -190,7 +267,7 @@ func TestServer_AppendEntries_TransitionsToFollowerIfNewLeaderSendsRPCInLeaderSt
 }
 
 func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.CurrentTerm = 1
 
@@ -227,7 +304,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowers(t *testing.T) {
 }
 
 func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntries(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	server.CurrentTerm = 1
 	server.Log = append(server.Log, LogEntry{
@@ -275,7 +352,7 @@ func TestServer_AppendEntries_AppendsNewEntriesToFollowersOverwritingInvalidEntr
 }
 
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	// Send a heartbeat to the Follower so it knows who the Leader is
 	req := (&AppendEntriesRequest{
@@ -300,7 +377,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenFollower(t *testing.T) {
 }
 
 func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 
 	// Send a heartbeat to the Follower so it knows who the Leader is
 
@@ -328,7 +405,7 @@ func TestServer_ApplyCommand_ReturnsErrNotLeaderWhenCandidate(t *testing.T) {
 }
 
 func TestServer_ApplyCommand_RejectsEmptyCommand(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.state = Leader
 	server.CurrentTerm = 1
 	server.leader = &ClusterMember{Id: 1}
@@ -357,7 +434,7 @@ func TestServer_ApplyCommand_RejectsEmptyCommand(t *testing.T) {
 }
 
 func TestServer_ApplyCommand_RejectsTooLargeCommand(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.state = Leader
 	server.CurrentTerm = 1
 	server.leader = &ClusterMember{Id: 1}
@@ -386,7 +463,7 @@ func TestServer_ApplyCommand_RejectsTooLargeCommand(t *testing.T) {
 	// Use a context with timeout and expect either success or context error, but not "too large"
 	// Simpler: just verify Write path would accept it via storage layer, and server validation lets it through
 	// Here we check the size check itself - mock transport to succeed
-	server2 := createNewServer()
+	server2 := createNewServer(t)
 	server2.state = Leader
 	server2.CurrentTerm = 1
 	server2.leader = &ClusterMember{Id: 1}
@@ -397,7 +474,7 @@ func TestServer_ApplyCommand_RejectsTooLargeCommand(t *testing.T) {
 }
 
 func Test_CommitEntriesFromPreviousTerms(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.id = MemberId(1)
 	server.state = Leader
 	server.CurrentTerm = 4
@@ -420,7 +497,7 @@ func Test_CommitEntriesFromPreviousTerms(t *testing.T) {
 }
 
 func TestServer_AdvanceCommitIndex_HandlesLaggingFollowers(t *testing.T) {
-	server := createNewServer()
+	server := createNewServer(t)
 	server.id = MemberId(1)
 	server.state = Leader
 	server.CurrentTerm = 2

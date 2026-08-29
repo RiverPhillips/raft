@@ -1,29 +1,28 @@
-package storage
+package raft
 
 import (
 	"bytes"
 	"fmt"
 	"testing"
 
-	"github.com/RiverPhillips/raft/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLogEntryRoundTrips(t *testing.T) {
 	tests := map[string]struct {
-		logEntry raft.LogEntry
+		logEntry LogEntry
 		size     uint32
 	}{
 		"Simple": {
-			logEntry: raft.LogEntry{
+			logEntry: LogEntry{
 				Term:    1,
-				Command: raft.Command("test"),
+				Command: Command("test"),
 			},
 			size: 20,
 		},
 		"Sentinel": {
-			logEntry: raft.LogEntry{
+			logEntry: LogEntry{
 				Term:    0,
 				Command: nil,
 			},
@@ -51,7 +50,7 @@ func TestLogEntryRoundTrips(t *testing.T) {
 func TestReturnAnErroryWhenLogEntryIsTruncated(t *testing.T) {
 	var b bytes.Buffer
 
-	err := WriteLogEntry(&b, &WALRecord{Entry: raft.LogEntry{Term: 1, Command: raft.Command("test")}})
+	err := WriteLogEntry(&b, &WALRecord{Entry: LogEntry{Term: 1, Command: Command("test")}})
 	require.NoError(t, err)
 
 	trunc := b.Bytes()[:4]
@@ -63,7 +62,7 @@ func TestReturnAnErroryWhenLogEntryIsTruncated(t *testing.T) {
 func TestReturnAnErroryWhenLogEntryHasAByteChanged(t *testing.T) {
 	var b bytes.Buffer
 
-	err := WriteLogEntry(&b, &WALRecord{Entry: raft.LogEntry{Term: 1, Command: raft.Command("test")}})
+	err := WriteLogEntry(&b, &WALRecord{Entry: LogEntry{Term: 1, Command: Command("test")}})
 	require.NoError(t, err)
 
 	buf := b.Bytes()
@@ -84,8 +83,8 @@ func TestMetadataRoundTrips(t *testing.T) {
 
 	state, err := storage.LoadState(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, state.CurrentTerm, raft.Term(10))
-	assert.Equal(t, state.VotedFor, raft.MemberId(1))
+	assert.Equal(t, state.CurrentTerm, Term(10))
+	assert.Equal(t, state.VotedFor, MemberId(1))
 }
 
 func TestLoadsLogs(t *testing.T) {
@@ -96,7 +95,7 @@ func TestLoadsLogs(t *testing.T) {
 	err = storage.WriteMetadata(t.Context(), 10, 1)
 	require.NoError(t, err)
 
-	err = storage.AppendToLog(t.Context(), raft.LogEntry{Term: raft.Term(10), Command: raft.Command("test")})
+	err = storage.AppendToLog(t.Context(), LogEntry{Term: Term(10), Command: Command("test")})
 	require.NoError(t, err)
 	require.NoError(t, storage.Close(t.Context()))
 
@@ -105,7 +104,7 @@ func TestLoadsLogs(t *testing.T) {
 
 	state, err := storage.LoadState(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, state.Log, []raft.LogEntry{{Term: raft.Term(10), Command: raft.Command("test")}})
+	assert.Equal(t, state.Log, []LogEntry{{Term: Term(10), Command: Command("test")}})
 
 }
 
@@ -116,8 +115,8 @@ func TestTruncateLog(t *testing.T) {
 
 	require.NoError(t, storage.WriteMetadata(t.Context(), 1, 1))
 	err = storage.AppendToLog(t.Context(),
-		raft.LogEntry{Term: raft.Term(1), Command: raft.Command("test1")},
-		raft.LogEntry{Term: raft.Term(2), Command: raft.Command("test2")},
+		LogEntry{Term: Term(1), Command: Command("test1")},
+		LogEntry{Term: Term(2), Command: Command("test2")},
 	)
 	require.NoError(t, err)
 
@@ -129,15 +128,15 @@ func TestTruncateLog(t *testing.T) {
 	state, err := storage.LoadState(t.Context())
 	require.NoError(t, err)
 
-	assert.Equal(t, []raft.LogEntry{
-		{Term: raft.Term(1), Command: raft.Command("test1")},
-		{Term: raft.Term(2), Command: raft.Command("test2")},
+	assert.Equal(t, []LogEntry{
+		{Term: Term(1), Command: Command("test1")},
+		{Term: Term(2), Command: Command("test2")},
 	}, state.Log)
 
 	err = storage.TruncateLog(t.Context(), uint64(2))
 	require.NoError(t, err)
 
-	require.NoError(t, storage.AppendToLog(t.Context(), raft.LogEntry{Term: 1, Command: raft.Command("test3")}))
+	require.NoError(t, storage.AppendToLog(t.Context(), LogEntry{Term: 1, Command: Command("test3")}))
 
 	require.NoError(t, storage.Close(t.Context()))
 
@@ -147,8 +146,8 @@ func TestTruncateLog(t *testing.T) {
 	state, err = storage.LoadState(t.Context())
 	require.NoError(t, err)
 
-	assert.Equal(t, []raft.LogEntry{
-		{Term: raft.Term(1), Command: raft.Command("test1")},
-		{Term: raft.Term(1), Command: raft.Command("test3")},
+	assert.Equal(t, []LogEntry{
+		{Term: Term(1), Command: Command("test1")},
+		{Term: Term(1), Command: Command("test3")},
 	}, state.Log)
 }

@@ -21,7 +21,7 @@ raft/                   # consensus core
     ondiskstorage.go    # OnDiskStorage (WAL + atomic metadata)
     ondiskstorage_test.go
 kv/sm.go                # in-memory KV StateMachine + binary command encoding
-justfile                # just test, just test-repeat, just stress
+justfile                # just test, just stress
 .github/workflows/ci.yml
 ```
 
@@ -64,8 +64,8 @@ go test ./...
 go test -race -coverprofile=coverage.txt -covermode=atomic ./...   # CI
 go test -race -count=20 ./raft
 just test
-just test-repeat 50
-just stress TestElectsALeader
+just stress 50
+just stress
 ```
 
 IDs must be >= 1. Cluster size must be odd (`NewServer` panics otherwise).
@@ -129,7 +129,7 @@ Conventions:
 - Tests mutate `server.currentTerm`, `server.log`, `server.state` directly; keep fields in the same package
 - `ApplyCommand` calls must pass a context (`context.Background()` or cancellable test context)
 
-When changing election, replication, or apply: run `go test -race ./raft` or `just test-repeat 20`. CI always uses `-race`.
+When changing election, replication, or apply: run `go test -race ./raft` or `just stress 20`. CI always uses `-race`.
 
 Preferred next milestones:
 1. Log truncation / overwrite support in `Storage` interface & `OnDiskStorage`.

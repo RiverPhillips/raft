@@ -1,4 +1,4 @@
-package storage
+package raft
 
 import (
 	"bytes"
@@ -12,8 +12,6 @@ import (
 	"path/filepath"
 	"sync"
 	"syscall"
-
-	"github.com/RiverPhillips/raft/raft"
 )
 
 const (
@@ -41,10 +39,10 @@ type OnDiskStorage struct {
 	uninitialized bool
 }
 
-var _ raft.Storage = (*OnDiskStorage)(nil)
+var _ Storage = (*OnDiskStorage)(nil)
 
 type WALRecord struct {
-	Entry    raft.LogEntry
+	Entry    LogEntry
 	FrameLen uint32
 }
 
@@ -77,7 +75,10 @@ func NewOnDiskStorage(dirPath string) (*OnDiskStorage, error) {
 	}, nil
 }
 
-func (s *OnDiskStorage) AppendToLog(ctx context.Context, logEntries ...raft.LogEntry) error {
+func (s *OnDiskStorage) AppendToLog(ctx context.Context, logEntries ...LogEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, l := range logEntries {
@@ -88,24 +89,27 @@ func (s *OnDiskStorage) AppendToLog(ctx context.Context, logEntries ...raft.LogE
 	return s.walFile.Sync()
 }
 
-func (s *OnDiskStorage) LoadState(ctx context.Context) (raft.PersistentState, error) {
+func (s *OnDiskStorage) LoadState(ctx context.Context) (PersistentState, error) {
+	if err := ctx.Err(); err != nil {
+		return PersistentState{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	metdataFile, err := os.OpenFile(filepath.Join(s.dirPath, METADATA_FILE), os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return raft.PersistentState{}, nil
+			return PersistentState{}, nil
 		}
-		return raft.PersistentState{}, err
+		return PersistentState{}, err
 	}
 	defer metdataFile.Close()
 
 	magicBuf := make([]byte, 4)
 	if _, err := io.ReadFull(metdataFile, magicBuf); err != nil {
-		return raft.PersistentState{}, nil
+		return PersistentState{}, nil
 	}
 	if !bytes.Equal(magicBuf, []byte(METADATA_MAGIC)) {
-		return raft.PersistentState{}, fmt.Errorf("invalid magic number in mesdata file. Expected: %x. Read: %x", []byte(METADATA_MAGIC), magicBuf)
+		return PersistentState{}, fmt.Errorf("invalid magic number in mesdata file. Expected: %x. Read: %x", []byte(METADATA_MAGIC), magicBuf)
 	}
 
 	termBuf := make([]byte, 8)
@@ -113,15 +117,15 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (raft.PersistentState, er
 	crcBuf := make([]byte, 4)
 
 	if _, err := io.ReadFull(metdataFile, termBuf); err != nil {
-		return raft.PersistentState{}, err
+		return PersistentState{}, err
 	}
 
 	if _, err := io.ReadFull(metdataFile, votedBuf); err != nil {
-		return raft.PersistentState{}, err
+		return PersistentState{}, err
 	}
 
 	if _, err := io.ReadFull(metdataFile, crcBuf); err != nil {
-		return raft.PersistentState{}, err
+		return PersistentState{}, err
 	}
 
 	crcHasher := crc32.NewIEEE()
@@ -129,17 +133,17 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (raft.PersistentState, er
 	crcHasher.Write(votedBuf)
 
 	if !bytes.Equal(crcBuf, crcHasher.Sum(nil)) {
-		return raft.PersistentState{}, errors.New("CORRUPTED METADATA: Checksum did not match")
+		return PersistentState{}, errors.New("CORRUPTED METADATA: Checksum did not match")
 	}
 
 	voted := binary.BigEndian.Uint32(votedBuf)
 	term := binary.BigEndian.Uint64(termBuf)
 
-	var log []raft.LogEntry
+	var log []LogEntry
 	var offset int64
 
 	if _, err := s.walFile.Seek(0, io.SeekStart); err != nil {
-		return raft.PersistentState{}, err
+		return PersistentState{}, err
 	}
 	for {
 		start := offset
@@ -150,10 +154,10 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (raft.PersistentState, er
 				break
 			}
 			if err = s.walFile.Truncate(start); err != nil {
-				return raft.PersistentState{}, err
+				return PersistentState{}, err
 			}
 			if _, err = s.walFile.Seek(start, io.SeekStart); err != nil {
-				return raft.PersistentState{}, err
+				return PersistentState{}, err
 			}
 			break
 		}
@@ -162,15 +166,18 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (raft.PersistentState, er
 		offset = start + int64(rec.FrameLen)
 	}
 
-	return raft.PersistentState{
-		VotedFor:    raft.NewMemberId(voted),
-		CurrentTerm: raft.Term(term),
+	return PersistentState{
+		VotedFor:    NewMemberId(voted),
+		CurrentTerm: Term(term),
 		Log:         log,
 	}, nil
 
 }
 
-func (s *OnDiskStorage) WriteMetadata(ctx context.Context, term raft.Term, votedFor raft.MemberId) error {
+func (s *OnDiskStorage) WriteMetadata(ctx context.Context, term Term, votedFor MemberId) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tmpPath := filepath.Join(s.dirPath, METADTA_TMP_FILE)
@@ -233,7 +240,7 @@ func WriteLogEntry(w io.Writer, rec *WALRecord) error {
 	if len(log.Command) == 0 && log.Term != 0 {
 		return errors.New("empty command not allowed")
 	}
-	if len(log.Command) > raft.MaxCommandSize {
+	if len(log.Command) > MaxCommandSize {
 		return errors.New("command too large")
 	}
 	hasher := crc32.NewIEEE()
@@ -285,7 +292,7 @@ func ReadLogEntry(r io.Reader) (WALRecord, error) {
 	}
 	hasher.Write(termBuf)
 
-	res.Entry.Term = raft.Term(binary.BigEndian.Uint64(termBuf))
+	res.Entry.Term = Term(binary.BigEndian.Uint64(termBuf))
 
 	if _, err := io.ReadFull(r, cmdLenBuf); err != nil {
 		return res, err
@@ -294,7 +301,7 @@ func ReadLogEntry(r io.Reader) (WALRecord, error) {
 	hasher.Write(cmdLenBuf)
 	cmdLen := binary.BigEndian.Uint32(cmdLenBuf)
 
-	if cmdLen > raft.MaxCommandSize {
+	if cmdLen > MaxCommandSize {
 		return res, errors.New("command too large")
 	}
 
@@ -352,6 +359,9 @@ func (s *OnDiskStorage) Close(ctx context.Context) error {
 // Truncates log removing all entries from index, 1 based indexing
 // i.e. Truncate(ctx, 2) removes all entries from position 2 onwards
 func (s *OnDiskStorage) TruncateLog(ctx context.Context, idx uint64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// Find the start of idx
 	// We're starting at position i
 	var curr uint64 = 1

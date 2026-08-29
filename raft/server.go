@@ -3,10 +3,9 @@ package raft
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"log/slog"
-	"math/big"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -35,6 +34,8 @@ type Server struct {
 	PersistentState
 	volatileState
 
+	storage Storage
+
 	state ServerState
 
 	leader *ClusterMember
@@ -43,14 +44,10 @@ type Server struct {
 }
 
 func getElectionTimeout() time.Duration {
-	r, err := rand.Int(rand.Reader, big.NewInt(150))
-	if err != nil {
-		panic("Failed to generate random number")
-	}
-	return time.Millisecond * time.Duration(minElectionTimeout+r.Int64())
+	return time.Millisecond * time.Duration(minElectionTimeout+rand.IntN(150))
 }
 
-func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport Transport, opts ...func(*Server) *Server) *Server {
+func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport Transport, storage Storage, opts ...func(*Server) *Server) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
 	}
@@ -61,6 +58,10 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 
 	if transport == nil {
 		panic("Transport is required")
+	}
+
+	if storage == nil {
+		panic("Storage is required")
 	}
 
 	hbTicker := time.NewTicker(heartbeatTimeout)
@@ -79,10 +80,11 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 		heartbeatTicker: hbTicker,
 		clusterMembers:  mm,
 		PersistentState: PersistentState{
-			Log: []LogEntry{{Term: 0, Command: nil}}, // Todo: Load from disk
+			Log: []LogEntry{{Term: 0}},
 		},
 		stateMachine: sm,
 		transport:    transport,
+		storage:      storage,
 	}
 
 	for _, opt := range opts {
@@ -103,13 +105,15 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 		}, nil
 	}
 
-	if s.state == Candidate {
-		if req.Term >= s.CurrentTerm {
-			s.state = Follower
-		}
+	if s.state != Follower && req.Term >= s.CurrentTerm {
+		s.heartbeatTicker.Stop()
+		s.state = Follower
+		s.resetElectionTimer()
 	}
 
-	s.updateTerm(req.Term)
+	if err := s.updateTerm(ctx, req.Term); err != nil {
+		return nil, err
+	}
 
 	resp := &AppendEntriesResult{}
 
@@ -150,29 +154,40 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 
 	nextIdx := req.PrevLogIndex + 1
 
-	for i := nextIdx; i < nextIdx+uint64(len(req.Entries)); i++ {
-		ent := req.Entries[i-nextIdx]
-		entry := LogEntry{
-			Term:    Term(ent.Term),
-			Command: ent.Command,
-		}
-		if i >= uint64(cap(s.Log)) {
-			// We're at the capacity of the log let's increase the capacity
-			newLen := nextIdx + uint64(len(req.Entries))
-			newLog := make([]LogEntry, i, newLen*2)
-			copy(newLog, s.Log)
-			s.Log = newLog
-		} else if logLen > i && s.Log[i].Term != entry.Term {
-			s.Log = s.Log[:i]
-			slog.Debug("Deleted conflicting entries from log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.Log))
-		}
+	var newEntries []LogEntry
+	for idx, entry := range req.Entries {
+		entryIdx := nextIdx + uint64(idx)
+		ent := LogEntry{Term: Term(entry.Term), Command: entry.Command}
 
-		slog.Debug("Appending entry to log", "server", s.id, "term", req.Term, "Leader", req.LeaderId, "index", i, "logLength", len(s.Log))
-		if i < uint64(len(s.Log)) {
-			slog.Debug("Log is unchanged")
+		if entryIdx < uint64(len(s.Log)) {
+			if s.Log[entryIdx].Term != ent.Term {
+				// Conflict found! Truncate in-memory and on-disk from entryIdx onwards
+				s.Log = s.Log[:entryIdx]
+				if err := s.storage.TruncateLog(ctx, entryIdx); err != nil {
+					if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
+					slog.Error("Failed to truncate log", "error", err)
+					panic("failed to truncate log")
+				}
+				// Append the replacement entry
+				s.Log = append(s.Log, ent)
+				newEntries = append(newEntries, ent)
+			}
+			// If terms match, the entry is already identical: do nothing and continue
 		} else {
-			s.Log = append(s.Log, entry)
+			// Entry is beyond the current log: append it
+			s.Log = append(s.Log, ent)
+			newEntries = append(newEntries, ent)
 		}
+	}
+
+	if err := s.storage.AppendToLog(ctx, newEntries...); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		slog.Error("Failed to append to log.", "error", err)
+		panic("Failed to append to log.")
 	}
 
 	if req.LeaderCommit > s.commitIndex {
@@ -183,24 +198,31 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 		}
 	}
 
-	// Todo: update state on disk
-
 	resp.Success = true
 
-	return (resp), nil
+	return resp, nil
 }
 
 // Must be called with the lock held
-func (s *Server) updateTerm(term Term) bool {
+func (s *Server) updateTerm(ctx context.Context, term Term) error {
 	if term > s.CurrentTerm {
+		s.heartbeatTicker.Stop()
 		s.state = Follower
 		s.CurrentTerm = term
 		s.VotedFor = 0
-		// Todo: update state on disk
+		err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return err
+			}
+			slog.Error("Failed to update metadata on disk.", "error", err)
+			panic("Failed to update metadata")
+
+		}
 		s.resetElectionTimer()
-		return true
+		return nil
 	}
-	return false
+	return nil
 }
 
 // Must be called with the lock held
@@ -215,7 +237,9 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 	slog.Info("Received request for vote", "server", s.id, "term", reqTerm, "Candidate", candidateId)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.updateTerm(reqTerm)
+	if err := s.updateTerm(ctx, reqTerm); err != nil {
+		return nil, err
+	}
 
 	resp := &RequestVoteResult{}
 
@@ -237,6 +261,13 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 	if grantVote {
 		slog.Debug("Voting for server", "server", candidateId)
 		s.VotedFor = candidateId
+		if err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor); err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return nil, err
+			}
+			slog.Error("Failed to persist vote metadata on disk", "error", err)
+			panic("Failed to persist vote metadata")
+		}
 		resp.VoteGranted = true
 		s.resetElectionTimer()
 		return (resp), nil
@@ -248,6 +279,16 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 
 func (s *Server) Start(ctx context.Context) error {
 	// todo: Load state from disk
+	state, err := s.storage.LoadState(ctx)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.CurrentTerm = state.CurrentTerm
+	s.VotedFor = state.VotedFor
+	s.Log = append([]LogEntry{{Term: 0, Command: nil}}, state.Log...)
+	s.mu.Unlock()
 
 	slog.Debug("Starting server as Follower")
 
@@ -268,6 +309,14 @@ func (s *Server) Start(ctx context.Context) error {
 			s.state = Candidate
 			s.CurrentTerm++
 			s.VotedFor = s.id
+			if err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor); err != nil {
+				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+					s.mu.Unlock()
+					return nil
+				}
+				slog.Error("Failed to persist election metadata on disk", "error", err)
+				panic("Failed to persist election metadata")
+			}
 
 			var wg sync.WaitGroup
 			wg.Add(len(s.clusterMembers))
@@ -301,8 +350,12 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 	s.mu.Lock()
 
 	if s.state != Leader {
+		var leaderId MemberId
+		if s.leader != nil {
+			leaderId = s.leader.Id
+		}
 		s.mu.Unlock()
-		return nil, &NotLeaderError{LeaderId: s.leader.Id}
+		return nil, &NotLeaderError{LeaderId: leaderId}
 	}
 
 	// Reject empty or oversized commands — sentinel {0,nil} is the only allowed empty entry
@@ -320,14 +373,24 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 	slog.Debug("Processing new commands", "commands", len(cmds))
 
 	// Append the command(s) to the log
+	var newEntries []LogEntry
 	for _, cmd := range cmds {
-		s.Log = append(s.Log, LogEntry{
+		entry := LogEntry{
 			Term:    s.CurrentTerm,
 			Command: cmd,
-		})
+		}
+		s.Log = append(s.Log, entry)
+		newEntries = append(newEntries, entry)
 	}
 
-	// Todo: persist to disk
+	if err := s.storage.AppendToLog(ctx, newEntries...); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			s.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		slog.Error("Failed to persist new entries on disk", "error", err)
+		panic("Failed to persist new entries on disk")
+	}
 
 	quorumChan := make(chan struct{}, 1)
 	var confirmed atomic.Int32
@@ -397,17 +460,21 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 				}
 
 				if !resp.Success {
-					slog.Error("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.CurrentTerm)
+					s.mu.Lock()
+					slog.Warn("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.CurrentTerm)
 					if member.nextIndex == 0 {
 						slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
 						panic("Follower is missing entries and Leader has no more entries to send")
 					}
-					member.nextIndex--
+					if member.nextIndex > 1 {
+						member.nextIndex--
+					}
+					s.mu.Unlock()
 				} else {
 					s.mu.Lock()
-					s.commitIndex = logLen
-					member.nextIndex++
-					member.matchIndex = s.commitIndex
+					member.matchIndex = prevLogIndex + uint64(len(entries))
+					member.nextIndex = member.matchIndex + 1
+					s.maybeAdvanceCommitIndex()
 					s.mu.Unlock()
 
 					// Entry was successfully replicated
@@ -425,7 +492,10 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 	// Wait for a quorum of servers to confirm the entry
 	select {
 	case <-quorumChan:
+		s.mu.Lock()
 		s.maybeAdvanceCommitIndex()
+		s.mu.Unlock()
+		s.sendHeartbeat(ctx)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -434,7 +504,7 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 	res := s.stateMachine.Apply(cmds...)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastApplied++
+	s.lastApplied += uint64(len(cmds))
 	return res, nil
 }
 
@@ -454,8 +524,10 @@ func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMembe
 	s.mu.Unlock()
 
 	resp, err := s.transport.RequestVote(ctx, member.Id, req)
-	if err != nil {
-		slog.Error("Error requesting vote", "member", member.Id, "error", err)
+	if err != nil || ctx.Err() != nil {
+		if err != nil {
+			slog.Error("Error requesting vote", "member", member.Id, "error", err)
+		}
 		// This will be retried on the next election timer tick
 		return
 	}
@@ -464,8 +536,11 @@ func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMembe
 	defer s.mu.Unlock()
 	slog.Debug("Received vote response", "server", member.Id, "voteGranted", resp.VoteGranted, "term", resp.Term)
 
-	if s.updateTerm(resp.Term) {
-		return
+	if err := s.updateTerm(ctx, resp.Term); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return
+		}
+		panic("Failed to write metadata to disk")
 	}
 
 	if resp.Term != req.Term {
@@ -539,9 +614,28 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 		}
 		go func(ctx context.Context, member *ClusterMember) {
 			s.mu.Lock()
+			if s.state != Leader {
+				s.mu.Unlock()
+				return
+			}
 
-			prevLogIndex := uint64(len(s.Log) - 1)
+			next := member.nextIndex
+			if next == 0 {
+				next = 1
+			}
+			prevLogIndex := next - 1
 			prevLogTerm := s.Log[prevLogIndex].Term
+
+			var entries []LogEntry
+			logLen := uint64(len(s.Log) - 1)
+			if logLen >= next {
+				for _, e := range s.Log[next:] {
+					entries = append(entries, LogEntry{
+						Term:    e.Term,
+						Command: e.Command,
+					})
+				}
+			}
 
 			req := &AppendEntriesRequest{
 				Term:         s.CurrentTerm,
@@ -549,29 +643,48 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 				LeaderCommit: s.commitIndex,
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  (prevLogTerm),
-				Entries:      []LogEntry{},
+				Entries:      entries,
 			}
 			s.mu.Unlock()
 
 			resp, err := s.transport.AppendEntries(ctx, member.Id, req)
-			if err != nil {
-				slog.Error("Error sending heartbeat", "error", err)
+			if err != nil || ctx.Err() != nil {
+				if err != nil {
+					slog.Error("Error sending heartbeat", "error", err)
+				}
 				return
 			}
 
-			_ = s.checkResponseTerm(Term(resp.Term))
+			if s.checkResponseTerm(Term(resp.Term)) {
+				return
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.state != Leader || Term(resp.Term) != s.CurrentTerm {
+				return
+			}
+
+			if resp.Success {
+				member.matchIndex = prevLogIndex + uint64(len(entries))
+				member.nextIndex = member.matchIndex + 1
+			} else {
+				if member.nextIndex > 1 {
+					member.nextIndex--
+				}
+			}
 		}(ctx, member)
 	}
 }
 
 func (s *Server) checkResponseTerm(respTerm Term) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	term := s.CurrentTerm
-	s.mu.Unlock()
 	if respTerm > term {
-		slog.Info("Transitioning to Follower", "Term", s.CurrentTerm)
-		s.mu.Lock()
-		defer s.mu.Unlock()
+		slog.Info("Transitioning to Follower", "Term", term)
+		s.heartbeatTicker.Stop()
 		s.CurrentTerm = respTerm
 		s.state = Follower
 		s.VotedFor = 0
@@ -594,9 +707,8 @@ func (s *Server) State() ServerState {
 	return s.state
 }
 
+// Must be called with the lock held
 func (s *Server) maybeAdvanceCommitIndex() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	matchIndexes := make([]uint64, 0, len(s.clusterMembers))
 	for k, v := range s.clusterMembers {
 		if k == s.id {

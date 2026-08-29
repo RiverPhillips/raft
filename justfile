@@ -2,11 +2,7 @@
 test:
 	go test -race ./...
 
-# Run tests repeatedly
-test-repeat count="20":
-	go test -race -count={{count}} ./...
-
 # Compile test binary and run with go stress tool (requires `go install golang.org/x/tools/cmd/stress@latest`)
-stress:
+stress count="1000":
 	go test -c -race ./raft -o /tmp/raft.test
-	stress /tmp/raft.test 
+	stress -failfast -count {{count}} /tmp/raft.test 
