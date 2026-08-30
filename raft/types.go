@@ -2,6 +2,8 @@ package raft
 
 import (
 	"context"
+
+	"github.com/RiverPhillips/raft/raft/storage"
 )
 
 type Term uint64
@@ -99,21 +101,21 @@ type RequestVoteResult struct {
 	VoteGranted bool
 }
 
-type PersistentState struct {
-	// Persistent state on all servers
-	CurrentTerm Term
-	VotedFor    MemberId
-	Log         []LogEntry
-}
-
 type Transport interface {
 	RequestVote(ctx context.Context, to MemberId, req *RequestVoteRequest) (*RequestVoteResult, error)
 	AppendEntries(ctx context.Context, to MemberId, req *AppendEntriesRequest) (*AppendEntriesResult, error)
 }
 
 type Storage interface {
-	WriteMetadata(ctx context.Context, currentTerm Term, votedFor MemberId) error
-	AppendToLog(ctx context.Context, logs ...LogEntry) error
-	LoadState(ctx context.Context) (PersistentState, error)
+	WriteMetadata(ctx context.Context, currentTerm uint64, votedFor uint32) error
+	AppendToLog(ctx context.Context, logs ...storage.LogEntry) error
+	LoadState(ctx context.Context) (storage.StoredState, error)
 	TruncateLog(ctx context.Context, idx uint64) error
+}
+
+type PersistentState struct {
+	// Persistent state on all servers
+	CurrentTerm Term
+	VotedFor    MemberId
+	Log         []LogEntry
 }

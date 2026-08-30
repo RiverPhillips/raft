@@ -1,4 +1,4 @@
-package raft
+package storage
 
 import (
 	"bytes"
@@ -18,7 +18,7 @@ const (
 	METADATA_MAGIC = "RAFT"
 	WAL_MAGIC      = "WAL"
 
-	METADATA_FILE    = "raft.metata"
+	METADATA_FILE    = "raft.metadata"
 	METADTA_TMP_FILE = "raft.metatadata.tmp"
 	LOCK_FILE        = "raft.lock"
 )
@@ -39,10 +39,13 @@ type OnDiskStorage struct {
 	uninitialized bool
 }
 
-var _ Storage = (*OnDiskStorage)(nil)
+type LogEntry struct {
+	Term    uint64
+	Command []byte
+}
 
-type WALRecord struct {
-	Entry    LogEntry
+type walRecord struct {
+	LogEntry LogEntry
 	FrameLen uint32
 }
 
@@ -82,34 +85,36 @@ func (s *OnDiskStorage) AppendToLog(ctx context.Context, logEntries ...LogEntry)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, l := range logEntries {
-		if err := WriteLogEntry(s.walFile, &WALRecord{Entry: l}); err != nil {
+		if err := WritelogEntry(s.walFile, &walRecord{LogEntry: l}); err != nil {
 			return err
 		}
 	}
 	return s.walFile.Sync()
 }
 
-func (s *OnDiskStorage) LoadState(ctx context.Context) (PersistentState, error) {
+func (s *OnDiskStorage) LoadState(ctx context.Context) (StoredState, error) {
 	if err := ctx.Err(); err != nil {
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	metdataFile, err := os.OpenFile(filepath.Join(s.dirPath, METADATA_FILE), os.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return PersistentState{}, nil
+			return StoredState{}, nil
 		}
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
-	defer metdataFile.Close()
+	defer func() {
+		_ = metdataFile.Close()
+	}()
 
 	magicBuf := make([]byte, 4)
 	if _, err := io.ReadFull(metdataFile, magicBuf); err != nil {
-		return PersistentState{}, nil
+		return StoredState{}, nil
 	}
 	if !bytes.Equal(magicBuf, []byte(METADATA_MAGIC)) {
-		return PersistentState{}, fmt.Errorf("invalid magic number in mesdata file. Expected: %x. Read: %x", []byte(METADATA_MAGIC), magicBuf)
+		return StoredState{}, fmt.Errorf("invalid magic number in mesdata file. Expected: %x. Read: %x", []byte(METADATA_MAGIC), magicBuf)
 	}
 
 	termBuf := make([]byte, 8)
@@ -117,15 +122,15 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (PersistentState, error) 
 	crcBuf := make([]byte, 4)
 
 	if _, err := io.ReadFull(metdataFile, termBuf); err != nil {
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
 
 	if _, err := io.ReadFull(metdataFile, votedBuf); err != nil {
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
 
 	if _, err := io.ReadFull(metdataFile, crcBuf); err != nil {
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
 
 	crcHasher := crc32.NewIEEE()
@@ -133,7 +138,7 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (PersistentState, error) 
 	crcHasher.Write(votedBuf)
 
 	if !bytes.Equal(crcBuf, crcHasher.Sum(nil)) {
-		return PersistentState{}, errors.New("CORRUPTED METADATA: Checksum did not match")
+		return StoredState{}, errors.New("CORRUPTED METADATA: Checksum did not match")
 	}
 
 	voted := binary.BigEndian.Uint32(votedBuf)
@@ -143,38 +148,38 @@ func (s *OnDiskStorage) LoadState(ctx context.Context) (PersistentState, error) 
 	var offset int64
 
 	if _, err := s.walFile.Seek(0, io.SeekStart); err != nil {
-		return PersistentState{}, err
+		return StoredState{}, err
 	}
 	for {
 		start := offset
-		rec, err := ReadLogEntry(s.walFile)
+		rec, err := ReadlogEntry(s.walFile)
 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err = s.walFile.Truncate(start); err != nil {
-				return PersistentState{}, err
+				return StoredState{}, err
 			}
 			if _, err = s.walFile.Seek(start, io.SeekStart); err != nil {
-				return PersistentState{}, err
+				return StoredState{}, err
 			}
 			break
 		}
 
-		log = append(log, rec.Entry)
+		log = append(log, rec.LogEntry)
 		offset = start + int64(rec.FrameLen)
 	}
 
-	return PersistentState{
-		VotedFor:    NewMemberId(voted),
-		CurrentTerm: Term(term),
+	return StoredState{
+		VotedFor:    voted,
+		CurrentTerm: term,
 		Log:         log,
 	}, nil
 
 }
 
-func (s *OnDiskStorage) WriteMetadata(ctx context.Context, term Term, votedFor MemberId) error {
+func (s *OnDiskStorage) WriteMetadata(ctx context.Context, term uint64, votedFor uint32) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -235,13 +240,10 @@ func (s *OnDiskStorage) WriteMetadata(ctx context.Context, term Term, votedFor M
 	return nil
 }
 
-func WriteLogEntry(w io.Writer, rec *WALRecord) error {
-	log := rec.Entry
+func WritelogEntry(w io.Writer, rec *walRecord) error {
+	log := rec.LogEntry
 	if len(log.Command) == 0 && log.Term != 0 {
 		return errors.New("empty command not allowed")
-	}
-	if len(log.Command) > MaxCommandSize {
-		return errors.New("command too large")
 	}
 	hasher := crc32.NewIEEE()
 
@@ -281,9 +283,9 @@ func WriteLogEntry(w io.Writer, rec *WALRecord) error {
 	return nil
 }
 
-func ReadLogEntry(r io.Reader) (WALRecord, error) {
+func ReadlogEntry(r io.Reader) (walRecord, error) {
 	hasher := crc32.NewIEEE()
-	res := WALRecord{}
+	res := walRecord{}
 
 	termBuf := make([]byte, 8)
 	cmdLenBuf := make([]byte, 4)
@@ -292,7 +294,7 @@ func ReadLogEntry(r io.Reader) (WALRecord, error) {
 	}
 	hasher.Write(termBuf)
 
-	res.Entry.Term = Term(binary.BigEndian.Uint64(termBuf))
+	res.LogEntry.Term = binary.BigEndian.Uint64(termBuf)
 
 	if _, err := io.ReadFull(r, cmdLenBuf); err != nil {
 		return res, err
@@ -301,19 +303,15 @@ func ReadLogEntry(r io.Reader) (WALRecord, error) {
 	hasher.Write(cmdLenBuf)
 	cmdLen := binary.BigEndian.Uint32(cmdLenBuf)
 
-	if cmdLen > MaxCommandSize {
-		return res, errors.New("command too large")
-	}
-
 	if cmdLen == 0 {
-		res.Entry.Command = nil
+		res.LogEntry.Command = nil
 	} else {
-		res.Entry.Command = make([]byte, cmdLen)
-		if _, err := io.ReadFull(r, res.Entry.Command); err != nil {
+		res.LogEntry.Command = make([]byte, cmdLen)
+		if _, err := io.ReadFull(r, res.LogEntry.Command); err != nil {
 			return res, err
 		}
 
-		hasher.Write(res.Entry.Command)
+		hasher.Write(res.LogEntry.Command)
 	}
 
 	checkSumBuf := make([]byte, 4)

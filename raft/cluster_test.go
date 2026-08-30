@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"github.com/RiverPhillips/raft/raft/storage"
+
 	"bytes"
 	"context"
 	"errors"
@@ -184,7 +186,7 @@ func NewInMemoryCluster(t *testing.T) InMemoryCluster {
 		for _, m := range memberIds {
 			clusterMembers = append(clusterMembers, &ClusterMember{Id: m})
 		}
-		store := &memoryStorage{}
+		store := &storage.InMemoryStorage{}
 		srv := NewServer(
 			m,
 			&RecordingStateMachine{},

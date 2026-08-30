@@ -2,9 +2,9 @@ package raft
 
 import (
 	"context"
-	"sync"
 	"testing"
 
+	"github.com/RiverPhillips/raft/raft/storage"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -22,7 +22,7 @@ func (noopTransport) AppendEntries(context.Context, MemberId, *AppendEntriesRequ
 func createNewServer(t *testing.T) *Server {
 	t.Helper()
 	sm := &NoOpStateMachine{}
-	store := &memoryStorage{}
+	store := &storage.InMemoryStorage{}
 	return NewServer(NewMemberId(1), sm, []*ClusterMember{
 		{
 			Id: NewMemberId(1),
@@ -35,81 +35,6 @@ func createNewServer(t *testing.T) *Server {
 		},
 	}, noopTransport{}, store)
 }
-
-// memoryStorage is an in-process Storage mock for protocol unit tests.
-// It mirrors the disk layout of OnDiskStorage (Log has no sentinel; index 1 is
-// the first real entry, and AppendingLog appends from the end), but is
-// unconstrained by files, checksums or empty-command rules so tests can
-// exercise pure Raft protocol logic (election, replication, conflict truncate)
-// against a controllable in-memory state.
-type memoryStorage struct {
-	mu        sync.Mutex
-	term      Term
-	votedFor  MemberId
-	log       []LogEntry
-	fatalErr  error // if set, every call returns this error (simulates disk failure)
-}
-
-func (m *memoryStorage) fail() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.fatalErr
-}
-
-func (m *memoryStorage) setFatalErr(err error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.fatalErr = err
-}
-
-func (m *memoryStorage) WriteMetadata(ctx context.Context, currentTerm Term, votedFor MemberId) error {
-	if err := m.fail(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.term = currentTerm
-	m.votedFor = votedFor
-	return nil
-}
-
-func (m *memoryStorage) AppendToLog(ctx context.Context, logs ...LogEntry) error {
-	if err := m.fail(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.log = append(m.log, logs...)
-	return nil
-}
-
-func (m *memoryStorage) LoadState(ctx context.Context) (PersistentState, error) {
-	if err := m.fail(); err != nil {
-		return PersistentState{}, err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	log := make([]LogEntry, len(m.log))
-	copy(log, m.log)
-	return PersistentState{CurrentTerm: m.term, VotedFor: m.votedFor, Log: log}, nil
-}
-
-// TruncateLog removes all entries from the 1-based index onwards.
-func (m *memoryStorage) TruncateLog(ctx context.Context, idx uint64) error {
-	if err := m.fail(); err != nil {
-		return err
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// 1-based; keep entries [0, idx-1)
-	keep := idx - 1
-	if keep >= uint64(len(m.log)) {
-		keep = uint64(len(m.log))
-	}
-	m.log = m.log[:keep]
-	return nil
-}
-
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }

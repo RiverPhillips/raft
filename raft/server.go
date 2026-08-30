@@ -10,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/RiverPhillips/raft/raft/storage"
+	"github.com/trailofbits/go-mutexasserts"
 )
 
 const (
@@ -47,6 +50,12 @@ func getElectionTimeout() time.Duration {
 	return time.Millisecond * time.Duration(minElectionTimeout+rand.IntN(150))
 }
 
+func WithStorage(storage Storage) func(srv *Server) {
+	return func(srv *Server) {
+		srv.storage = storage
+	}
+}
+
 func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport Transport, storage Storage, opts ...func(*Server) *Server) *Server {
 	if id < 1 {
 		panic("Server ID must be an integer greater than 0")
@@ -79,12 +88,10 @@ func NewServer(id MemberId, sm StateMachine, members []*ClusterMember, transport
 		electionTicker:  time.NewTicker(getElectionTimeout()),
 		heartbeatTicker: hbTicker,
 		clusterMembers:  mm,
-		PersistentState: PersistentState{
-			Log: []LogEntry{{Term: 0}},
-		},
-		stateMachine: sm,
-		transport:    transport,
-		storage:      storage,
+		Log:             []LogEntry{{Term: 0}},
+		stateMachine:    sm,
+		transport:       transport,
+		storage:         storage,
 	}
 
 	for _, opt := range opts {
@@ -154,7 +161,7 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 
 	nextIdx := req.PrevLogIndex + 1
 
-	var newEntries []LogEntry
+	var storageEntries []storage.LogEntry
 	for idx, entry := range req.Entries {
 		entryIdx := nextIdx + uint64(idx)
 		ent := LogEntry{Term: Term(entry.Term), Command: entry.Command}
@@ -172,17 +179,16 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 				}
 				// Append the replacement entry
 				s.Log = append(s.Log, ent)
-				newEntries = append(newEntries, ent)
+				storageEntries = append(storageEntries, storage.LogEntry{Term: uint64(ent.Term), Command: ent.Command})
 			}
-			// If terms match, the entry is already identical: do nothing and continue
 		} else {
 			// Entry is beyond the current log: append it
 			s.Log = append(s.Log, ent)
-			newEntries = append(newEntries, ent)
+			storageEntries = append(storageEntries, storage.LogEntry{Term: uint64(ent.Term), Command: ent.Command})
 		}
 	}
 
-	if err := s.storage.AppendToLog(ctx, newEntries...); err != nil {
+	if err := s.storage.AppendToLog(ctx, storageEntries...); err != nil {
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -191,11 +197,8 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 	}
 
 	if req.LeaderCommit > s.commitIndex {
-		prevCommitIdx := s.commitIndex
 		s.commitIndex = min(req.LeaderCommit, uint64(len(s.Log)-1))
-		for i := prevCommitIdx + 1; i <= s.commitIndex; i++ {
-			s.stateMachine.Apply(s.Log[i].Command)
-		}
+		s.applyEntriesLocked()
 	}
 
 	resp.Success = true
@@ -205,12 +208,13 @@ func (s *Server) AppendEntries(ctx context.Context, req *AppendEntriesRequest) (
 
 // Must be called with the lock held
 func (s *Server) updateTerm(ctx context.Context, term Term) error {
+	mutexasserts.AssertMutexLocked(&s.mu)
 	if term > s.CurrentTerm {
 		s.heartbeatTicker.Stop()
 		s.state = Follower
 		s.CurrentTerm = term
 		s.VotedFor = 0
-		err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor)
+		err := s.storage.WriteMetadata(ctx, uint64(s.CurrentTerm), uint32(s.VotedFor))
 		if err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return err
@@ -227,6 +231,7 @@ func (s *Server) updateTerm(ctx context.Context, term Term) error {
 
 // Must be called with the lock held
 func (s *Server) resetElectionTimer() {
+	mutexasserts.AssertMutexLocked(&s.mu)
 	s.electionTicker.Reset(getElectionTimeout())
 }
 
@@ -251,17 +256,16 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 		return (resp), nil
 	}
 
-	logLen := uint64(len(s.Log) - 1)
-	myLastTerm := s.Log[logLen].Term
+	lastLogIndex, lastLogTerm := s.lastLogIndexAndTermLocked()
 	reqLastTerm := Term(req.LastLogTerm)
 
-	logValid := reqLastTerm > myLastTerm || (reqLastTerm == myLastTerm && req.LastLogIndex >= logLen)
+	logValid := reqLastTerm > lastLogTerm || (reqLastTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex)
 	grantVote := reqTerm >= s.CurrentTerm && (s.VotedFor == 0 || s.VotedFor == candidateId) && logValid
 
 	if grantVote {
 		slog.Debug("Voting for server", "server", candidateId)
 		s.VotedFor = candidateId
-		if err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor); err != nil {
+		if err := s.storage.WriteMetadata(ctx, uint64(s.CurrentTerm), uint32(s.VotedFor)); err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return nil, err
 			}
@@ -272,25 +276,31 @@ func (s *Server) RequestVote(ctx context.Context, req *RequestVoteRequest) (*Req
 		s.resetElectionTimer()
 		return (resp), nil
 	} else {
-		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.VotedFor, "lastLogIndex", req.LastLogIndex, "logLength", logLen)
+		slog.Debug("Rejecting vote request. Log was not up to date enough", "server", s.id, "term", reqTerm, "Candidate", req.CandidateId, "votedFor", s.VotedFor, "lastLogIndex", req.LastLogIndex, "logLength", lastLogIndex)
 	}
 	return (resp), nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	// todo: Load state from disk
 	state, err := s.storage.LoadState(ctx)
 	if err != nil {
 		return err
 	}
 
+	log := make([]LogEntry, 0, len(state.Log)+1)
+	log = append(log, LogEntry{Term: 0, Command: nil})
+	for _, e := range state.Log {
+		log = append(log, LogEntry{Term: Term(e.Term), Command: e.Command})
+	}
+
 	s.mu.Lock()
-	s.CurrentTerm = state.CurrentTerm
-	s.VotedFor = state.VotedFor
-	s.Log = append([]LogEntry{{Term: 0, Command: nil}}, state.Log...)
+	s.CurrentTerm = Term(state.CurrentTerm)
+	s.VotedFor = MemberId(state.VotedFor)
+	s.Log = log
+	s.applyEntriesLocked()
 	s.mu.Unlock()
 
-	slog.Debug("Starting server as Follower")
+	slog.Info("Starting server as Follower", "MemberId", s.id)
 
 	// Start the election timer
 	// If the election timer elapses without receiving AppendEntries RPC from the current Leader or granting a vote to another Candidate, convert to Candidate
@@ -309,7 +319,7 @@ func (s *Server) Start(ctx context.Context) error {
 			s.state = Candidate
 			s.CurrentTerm++
 			s.VotedFor = s.id
-			if err := s.storage.WriteMetadata(ctx, s.CurrentTerm, s.VotedFor); err != nil {
+			if err := s.storage.WriteMetadata(ctx, uint64(s.CurrentTerm), uint32(s.VotedFor)); err != nil {
 				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 					s.mu.Unlock()
 					return nil
@@ -340,7 +350,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 			slog.Debug("Sending heartbeat")
-			s.sendHeartbeat(context.TODO())
+			s.sendHeartbeat(ctx)
 		}
 	}
 }
@@ -372,147 +382,121 @@ func (s *Server) ApplyCommand(ctx context.Context, cmds ...Command) ([]Result, e
 
 	slog.Debug("Processing new commands", "commands", len(cmds))
 
-	// Append the command(s) to the log
-	var newEntries []LogEntry
+	quorumChan := make(chan struct{})
+	var confirmed atomic.Int32
+	confirmed.Store(0)
+
+	quorumSize := s.getQuorumSize()
+
+	var storageEntries []storage.LogEntry
+	// Synchronously write to in memory log
 	for _, cmd := range cmds {
 		entry := LogEntry{
 			Term:    s.CurrentTerm,
 			Command: cmd,
 		}
 		s.Log = append(s.Log, entry)
-		newEntries = append(newEntries, entry)
-	}
-
-	if err := s.storage.AppendToLog(ctx, newEntries...); err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			s.mu.Unlock()
-			return nil, ctx.Err()
-		}
-		slog.Error("Failed to persist new entries on disk", "error", err)
-		panic("Failed to persist new entries on disk")
-	}
-
-	quorumChan := make(chan struct{}, 1)
-	var confirmed atomic.Int32
-	confirmed.Store(1) // Leader already confirmed
-
-	quorumSize := s.getQuorumSize()
-	if quorumSize <= 1 {
-		quorumChan <- struct{}{}
+		storageEntries = append(storageEntries, storage.LogEntry{
+			Term:    uint64(entry.Term),
+			Command: entry.Command,
+		})
 	}
 	s.mu.Unlock()
-
 	// Issue AppendEntries RPCs in parallel to each of the other servers to replicate the entry
+	// Perist the in memory log to disk here
 	for _, member := range s.clusterMembers {
 		if member.Id == s.id {
-			continue
-		}
+			go func() {
 
-		go func(member *ClusterMember) {
-			// Todo: Add a limit to the number of entries that can be sent in a single RPC
-			// Todo: This retry loop should have an exponential backoff or something
-
-			for {
-				if ctx.Err() != nil {
-					return
-				}
-
-				s.mu.Lock()
-				next := member.nextIndex
-				prevLogIndex := next - 1
-				prevLogTerm := s.Log[prevLogIndex].Term
-
-				var entries []LogEntry
-				logLen := uint64(len(s.Log) - 1)
-				if logLen >= next {
-					for _, e := range s.Log[next:] {
-						entries = append(entries, LogEntry{
-							Term:    e.Term,
-							Command: e.Command,
-						})
-					}
-				}
-
-				req := &AppendEntriesRequest{
-					Term:         (s.CurrentTerm),
-					LeaderId:     (s.id),
-					LeaderCommit: s.commitIndex,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  (prevLogTerm),
-					Entries:      entries,
-				}
-				s.mu.Unlock()
-
-				resp, err := s.transport.AppendEntries(ctx, member.Id, req)
-				if err != nil {
-					slog.Error("Error replicating entry", "server", member.Id, "error", err)
-					select {
-					case <-ctx.Done():
+				if err := s.storage.AppendToLog(ctx, storageEntries...); err != nil {
+					if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 						return
-					case <-time.After(20 * time.Millisecond):
-						continue
+					}
+					slog.Error("Failed to persist new entries on disk", "error", err)
+					panic("Failed to persist new entries on disk")
+
+				}
+				if int(confirmed.Add(1)) == quorumSize {
+					select {
+					case quorumChan <- struct{}{}:
+					default:
 					}
 				}
+			}()
+		} else {
+			go func(member *ClusterMember) {
+				// Todo: Add a limit to the number of entries that can be sent in a single RPC
+				// Todo: This retry loop should have an exponential backoff or something
 
-				term := Term(resp.Term)
-				if s.checkResponseTerm(term) {
-					break
-				}
+				for {
+					if ctx.Err() != nil {
+						return
+					}
 
-				if !resp.Success {
 					s.mu.Lock()
-					slog.Warn("Failed to replicate entry", "server", member.Id, "followerTerm", term, "leaderTerm", s.CurrentTerm)
-					if member.nextIndex == 0 {
-						slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
-						panic("Follower is missing entries and Leader has no more entries to send")
-					}
-					if member.nextIndex > 1 {
-						member.nextIndex--
-					}
-					s.mu.Unlock()
-				} else {
-					s.mu.Lock()
-					member.matchIndex = prevLogIndex + uint64(len(entries))
-					member.nextIndex = member.matchIndex + 1
-					s.maybeAdvanceCommitIndex()
+					req := s.makeAppendEntriesRequestLocked(member)
+					prevLogIndex := req.PrevLogIndex
+					entriesCount := len(req.Entries)
 					s.mu.Unlock()
 
-					// Entry was successfully replicated
-					if int(confirmed.Add(1)) == quorumSize {
+					resp, err := s.transport.AppendEntries(ctx, member.Id, req)
+					if err != nil {
+						slog.Error("Error replicating entry", "server", member.Id, "error", err)
 						select {
-						case quorumChan <- struct{}{}:
-						default:
+						case <-ctx.Done():
+							return
+						case <-time.After(20 * time.Millisecond):
+							continue
 						}
 					}
-					break
+
+					term := Term(resp.Term)
+					if s.checkResponseTerm(term) {
+						break
+					}
+
+					s.mu.Lock()
+					id := member.Id
+					currentTerm := s.CurrentTerm
+					s.handleAppendEntriesResponseLocked(member, prevLogIndex, entriesCount, resp.Success)
+					s.mu.Unlock()
+					if !resp.Success {
+						slog.Warn("Failed to replicate entry", "server", id, "followerTerm", term, "leaderTerm", currentTerm)
+						if member.nextIndex == 0 {
+							slog.With("Follower is missing entries and Leader has no more entries to send", "member", member.Id)
+							panic("Follower is missing entries and Leader has no more entries to send")
+						}
+					} else {
+						// Entry was successfully replicated
+						if int(confirmed.Add(1)) == quorumSize {
+							select {
+							case quorumChan <- struct{}{}:
+							default:
+							}
+						}
+						break
+					}
 				}
-			}
-		}(member)
+			}(member)
+		}
 	}
 	// Wait for a quorum of servers to confirm the entry
 	select {
 	case <-quorumChan:
 		s.mu.Lock()
 		s.maybeAdvanceCommitIndex()
+		results := s.applyEntriesLocked()
 		s.mu.Unlock()
-		s.sendHeartbeat(ctx)
+		return results, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-
-	// Return the result of that execution to the client, this can't return an error as the command is already committed.
-	res := s.stateMachine.Apply(cmds...)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastApplied += uint64(len(cmds))
-	return res, nil
 }
 
 func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMember) {
 	s.mu.Lock()
 	slog.Debug("Requesting vote from server", "server", member.Id)
-	lastLogIndex := uint64(len(s.Log) - 1)
-	lastLogTerm := s.Log[lastLogIndex].Term
+	lastLogIndex, lastLogTerm := s.lastLogIndexAndTermLocked()
 
 	req := &RequestVoteRequest{
 		Term:         (s.CurrentTerm),
@@ -557,6 +541,7 @@ func (s *Server) requestVoteFromMember(ctx context.Context, member *ClusterMembe
 
 // Must be called with the lock held
 func (s *Server) checkIfElected(ctx context.Context) {
+	mutexasserts.AssertMutexLocked(&s.mu)
 	if s.state == Candidate {
 		// If we're a Candidate we need to check if we've received a majority of votes
 		// If we have, we become the Leader
@@ -596,7 +581,9 @@ func (s *Server) getQuorumSize() int {
 	return (len(s.clusterMembers) + 1) / 2
 }
 
+// Must be called with the lock held
 func (s *Server) initializeVolatileLeaderState() {
+	mutexasserts.AssertMutexLocked(&s.mu)
 	for _, m := range s.clusterMembers {
 		// NextIndex for each server is initialized to the Leader's last log index + 1
 		m.nextIndex = uint64(len(s.Log))
@@ -619,32 +606,7 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 				return
 			}
 
-			next := member.nextIndex
-			if next == 0 {
-				next = 1
-			}
-			prevLogIndex := next - 1
-			prevLogTerm := s.Log[prevLogIndex].Term
-
-			var entries []LogEntry
-			logLen := uint64(len(s.Log) - 1)
-			if logLen >= next {
-				for _, e := range s.Log[next:] {
-					entries = append(entries, LogEntry{
-						Term:    e.Term,
-						Command: e.Command,
-					})
-				}
-			}
-
-			req := &AppendEntriesRequest{
-				Term:         s.CurrentTerm,
-				LeaderId:     (s.id),
-				LeaderCommit: s.commitIndex,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  (prevLogTerm),
-				Entries:      entries,
-			}
+			req := s.makeAppendEntriesRequestLocked(member)
 			s.mu.Unlock()
 
 			resp, err := s.transport.AppendEntries(ctx, member.Id, req)
@@ -665,18 +627,12 @@ func (s *Server) sendHeartbeat(ctx context.Context) {
 				return
 			}
 
-			if resp.Success {
-				member.matchIndex = prevLogIndex + uint64(len(entries))
-				member.nextIndex = member.matchIndex + 1
-			} else {
-				if member.nextIndex > 1 {
-					member.nextIndex--
-				}
-			}
+			s.handleAppendEntriesResponseLocked(member, req.PrevLogIndex, len(req.Entries), resp.Success)
 		}(ctx, member)
 	}
 }
 
+// CheckResponseTerm
 func (s *Server) checkResponseTerm(respTerm Term) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -708,7 +664,61 @@ func (s *Server) State() ServerState {
 }
 
 // Must be called with the lock held
+func (s *Server) lastLogIndexAndTermLocked() (uint64, Term) {
+	mutexasserts.AssertMutexLocked(&s.mu)
+	lastLogIndex := uint64(len(s.Log) - 1)
+	return lastLogIndex, s.Log[lastLogIndex].Term
+}
+
+// Must be called with the lock held
+func (s *Server) makeAppendEntriesRequestLocked(member *ClusterMember) *AppendEntriesRequest {
+	mutexasserts.AssertMutexLocked(&s.mu)
+	next := member.nextIndex
+	if next == 0 {
+		next = 1
+	}
+	prevLogIndex := next - 1
+	prevLogTerm := s.Log[prevLogIndex].Term
+
+	var entries []LogEntry
+	logLen := uint64(len(s.Log) - 1)
+	if logLen >= next {
+		for _, e := range s.Log[next:] {
+			entries = append(entries, LogEntry{
+				Term:    e.Term,
+				Command: e.Command,
+			})
+		}
+	}
+
+	req := &AppendEntriesRequest{
+		Term:         s.CurrentTerm,
+		LeaderId:     s.id,
+		LeaderCommit: s.commitIndex,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+	}
+	return req
+}
+
+// Must be called with the lock held
+func (s *Server) handleAppendEntriesResponseLocked(member *ClusterMember, prevLogIndex uint64, entriesCount int, success bool) {
+	mutexasserts.AssertMutexLocked(&s.mu)
+	if success {
+		member.matchIndex = prevLogIndex + uint64(entriesCount)
+		member.nextIndex = member.matchIndex + 1
+		s.maybeAdvanceCommitIndex()
+	} else {
+		if member.nextIndex > 1 {
+			member.nextIndex--
+		}
+	}
+}
+
+// Must be called with the lock held
 func (s *Server) maybeAdvanceCommitIndex() uint64 {
+	mutexasserts.AssertMutexLocked(&s.mu)
 	matchIndexes := make([]uint64, 0, len(s.clusterMembers))
 	for k, v := range s.clusterMembers {
 		if k == s.id {
@@ -723,4 +733,16 @@ func (s *Server) maybeAdvanceCommitIndex() uint64 {
 		s.commitIndex = majorityIndex
 	}
 	return s.commitIndex
+}
+
+// Must be called with the lock held
+func (s *Server) applyEntriesLocked() []Result {
+	mutexasserts.AssertMutexLocked(&s.mu)
+	var results []Result
+	for s.commitIndex > s.lastApplied {
+		s.lastApplied++
+		res := s.stateMachine.Apply(s.Log[s.lastApplied].Command)
+		results = append(results, res...)
+	}
+	return results
 }
