@@ -26,9 +26,10 @@ const (
 var (
 	ErrNotDir       = errors.New("path is not for a directory")
 	ErrCorruptedWAL = errors.New("corrupted WAL entry. CRC did not match")
+
+	maxBatchSize = 1000
 )
 
-// Todo flock for process isolation
 type OnDiskStorage struct {
 	mu sync.Mutex
 
@@ -37,6 +38,8 @@ type OnDiskStorage struct {
 
 	dirPath       string
 	uninitialized bool
+	walChan       chan walQueueEntry
+	writerDone    chan struct{}
 }
 
 type LogEntry struct {
@@ -47,6 +50,11 @@ type LogEntry struct {
 type walRecord struct {
 	LogEntry LogEntry
 	FrameLen uint32
+}
+
+type walQueueEntry struct {
+	records []*walRecord
+	done    chan error
 }
 
 func NewOnDiskStorage(dirPath string) (*OnDiskStorage, error) {
@@ -70,26 +78,94 @@ func NewOnDiskStorage(dirPath string) (*OnDiskStorage, error) {
 		return nil, err
 	}
 
-	return &OnDiskStorage{
+	s := &OnDiskStorage{
 		walFile:       walFile,
 		dirPath:       dirPath,
 		uninitialized: errors.Is(statErr, os.ErrNotExist),
 		lockFile:      lockFile,
-	}, nil
+		walChan:       make(chan walQueueEntry, 1000),
+		writerDone:    make(chan struct{}),
+	}
+
+	go s.walWriterLoop()
+	return s, nil
+}
+
+func (s *OnDiskStorage) walWriterLoop() {
+	defer close(s.writerDone)
+
+	for entry := range s.walChan {
+		batch := []walQueueEntry{entry}
+
+		// Opportunistic batch drain
+	drainLoop:
+		for len(batch) < maxBatchSize {
+			select {
+			case next, ok := <-s.walChan:
+				if !ok {
+					break drainLoop
+				}
+				batch = append(batch, next)
+			default:
+				break drainLoop
+			}
+		}
+
+		// Write batch to disk
+		var err error
+		for _, qe := range batch {
+			for _, r := range qe.records {
+				if err = WritelogEntry(s.walFile, r); err != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+
+		// Single fsync for the entire batch
+		if err == nil {
+			err = s.walFile.Sync()
+		}
+
+		// Notify all callers in this batch
+		for _, qe := range batch {
+			qe.done <- err
+		}
+	}
 }
 
 func (s *OnDiskStorage) AppendToLog(ctx context.Context, logEntries ...LogEntry) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, l := range logEntries {
-		if err := WritelogEntry(s.walFile, &walRecord{LogEntry: l}); err != nil {
-			return err
-		}
+	if len(logEntries) == 0 {
+		return nil
 	}
-	return s.walFile.Sync()
+
+	done := make(chan error, 1)
+	queueEntry := walQueueEntry{
+		done:    done,
+		records: make([]*walRecord, 0, len(logEntries)),
+	}
+
+	for _, l := range logEntries {
+		queueEntry.records = append(queueEntry.records, &walRecord{LogEntry: l})
+	}
+
+	select {
+	case s.walChan <- queueEntry:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-done:
+		return err
+	}
 }
 
 func (s *OnDiskStorage) LoadState(ctx context.Context) (StoredState, error) {
@@ -331,6 +407,13 @@ func ReadlogEntry(r io.Reader) (walRecord, error) {
 func (s *OnDiskStorage) Close(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.walChan != nil {
+		close(s.walChan)
+		s.walChan = nil
+		<-s.writerDone
+	}
+
 	if s.walFile == nil {
 		return nil
 	}

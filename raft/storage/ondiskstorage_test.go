@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 
@@ -150,4 +151,25 @@ func TestTruncateLog(t *testing.T) {
 		{Term: (1), Command: []byte("test1")},
 		{Term: (1), Command: []byte("test3")},
 	}, state.Log)
+}
+
+func BenchmarkOnDiskStorage_Parallel(b *testing.B) {
+	ctx := context.Background()
+	dir := b.TempDir()
+	store, err := NewOnDiskStorage(dir)
+	require.NoError(b, err)
+	defer func() { _ = store.Close(ctx) }()
+
+	entry := LogEntry{Term: 1, Command: []byte("benchmark-command-payload")}
+
+	// b.SetParallelism(100) // optional: pushes concurrency to 100x GOMAXPROCS to simulate 1000+ callers
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if err := store.AppendToLog(ctx, entry); err != nil {
+				b.Errorf("AppendToLog failed: %v", err)
+			}
+		}
+	})
 }
